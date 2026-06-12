@@ -1,0 +1,19 @@
+{
+  "header": {
+    "resultMsg": "OK",
+    "resultCode": "00"
+  },
+  "body": {
+    "totalCount": "1",
+    "items": {
+      "item": {
+        "techGdlnNo": "KOSHA-003",
+        "techGdlnNm": "공작기계 정비 작업 안전에 관한 지침",
+        "techGdlnKnd": "기계",
+        "fileDownlUrl": "https://example.com/kosha003.hwpx"
+      }
+    },
+    "numOfRows": "10",
+    "pageNo": "1"
+  }
+}

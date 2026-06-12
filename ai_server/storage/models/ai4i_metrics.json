@@ -17,13 +17,13 @@
   ],
   "validation": {
     "test_size": 2000,
-    "failure_accuracy": 0.9785,
-    "failure_precision": 0.766,
-    "failure_recall": 0.5294,
-    "failure_f1": 0.6261,
-    "failure_roc_auc": 0.9563,
-    "mode_micro_f1": 0.5882,
-    "mode_macro_f1": 0.4376
+    "failure_accuracy": 0.9805,
+    "failure_precision": 0.7843,
+    "failure_recall": 0.5882,
+    "failure_f1": 0.6723,
+    "failure_roc_auc": 0.952,
+    "mode_micro_f1": 0.5641,
+    "mode_macro_f1": 0.3976
   },
   "thresholds": {
     "failure_predicted": 0.5,

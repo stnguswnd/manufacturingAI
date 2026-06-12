@@ -1,7 +1,63 @@
-.venv/
-__pycache__/
-*.pyc
-*.log
+# Local environment
 .env
-ai_server/storage/history/*.jsonl
+.env.*
+!.env.example
+!ai_server/.env.example
+.env.local
+.python-version.local
+
+# Python virtual environments / installed libraries
+.venv/
+.venv*/
+venv/
+env/
+ENV/
+
+# Python cache / test / type-check artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.coverage
+coverage.xml
+htmlcov/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Logs and local runtime files
+*.log
+*.pid
+*.tmp
+.DS_Store
+
+# Local databases and generated agent runtime state
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+ai_server/storage/history/
+ai_server/storage/checkpoints/
+ai_server/data/raw/
+ai_server/data/vector_db/
+ai_server/data/chroma/
+ai_server/data/checkpoints/*.sqlite3
+ai_server/data/checkpoints/*.db
+
+# Generated model/vector artifacts
+ai_server/storage/models/*.joblib
+ai_server/storage/models/*.pkl
+ai_server/storage/models/*metrics*.json
+ai_server/storage/vector_store/*.joblib
+ai_server/storage/vector_store/*.sqlite*
+ai_server/storage/vector_store/chroma/
+ai_server/storage/vector_store/faiss/
+
 backend_spring/data/

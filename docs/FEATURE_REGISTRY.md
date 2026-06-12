@@ -58,3 +58,30 @@
 - Demo steps: 모델 선택창에서 비활성 모델 목록 확인
 - Follow-up: org/user role 기반 모델 정책
 
+## F-005: User-scoped Context Engineering
+
+- Status: done
+- User value: 유저별 이전 실행 이력과 장기 memory를 활용해 더 일관된 Agent 답변 제공
+- Main files: `schemas.py`, `main.py`, `storage`, `user_service.py`, `context_service.py`, `memory_service.py`, `streamlit_app.py`
+- API/UI entry: `/users`, `/users/{user_id}/context`, `/agent/send`
+- Data dependency: SQLite users/sessions/memories/agent_runs
+- Cost impact: context injection으로 input token 증가 가능
+- Safety impact: 과거 context가 현재 safety gate를 덮어쓰지 못하도록 우선순위 필요
+- Observability: user hash, context count, estimated context tokens
+- Tests: user isolation, delete cascade, context budget, memory extraction, agent history integration
+- Demo steps: 유저 A/B를 만들고 각기 다른 history가 context에 반영되는지 확인
+- Follow-up: embedding 기반 similar run retrieval
+
+## F-006: Chroma PDF Ingestion
+
+- Status: planned
+- User value: PDF 제조 문서를 업로드하면 semantic RAG 검색에 즉시 반영
+- Main files: `chroma_rag_service.py`, `embedding_service.py`, `document_ingestion_service.py`, `sqlite_store.py`, `streamlit_app.py`
+- API/UI entry: `/rag/documents/upload`, `/rag/documents`, `/rag/search`, Streamlit RAG tab
+- Data dependency: PDF files, OpenAI embeddings or fake embedding in tests
+- Cost impact: embedding 생성 비용 발생
+- Safety impact: safety procedure 문서 metadata filter와 citation 품질 개선
+- Observability: embedding token usage, indexed chunk count, vector search latency
+- Tests: PDF extraction, Chroma upsert/search, metadata filter, delete cascade
+- Demo steps: PDF 업로드 후 관련 질문에서 새 문서 citation 확인
+- Follow-up: hybrid BM25 + vector search, OCR fallback

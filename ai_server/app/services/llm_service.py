@@ -18,6 +18,7 @@ from app.config import (
     OPENAI_BASE_URL,
     OPENAI_ORG_ID,
     OPENAI_PROJECT_ID,
+    USD_KRW_EXCHANGE_RATE,
 )
 from app.errors import LLMUnavailableError, ModelSelectionError
 from app.schemas import LLMUsageRecord
@@ -189,6 +190,7 @@ class LLMService:
         total_tokens = self._usage_int(usage, 'total_tokens') or (input_tokens + output_tokens)
         cached_input_tokens = self._cached_input_tokens(usage)
         cost = self.estimate_cost_usd(model=model, input_tokens=input_tokens, output_tokens=output_tokens, cached_input_tokens=cached_input_tokens)
+        cost_krw = self.estimate_cost_krw(cost)
         return LLMUsageRecord(
             provider=self.provider,
             model=model,
@@ -198,6 +200,8 @@ class LLMService:
             cached_input_tokens=cached_input_tokens,
             total_tokens=total_tokens,
             estimated_cost_usd=cost,
+            estimated_cost_krw=cost_krw,
+            usd_krw_exchange_rate=USD_KRW_EXCHANGE_RATE,
             latency_ms=round(latency_ms, 2),
         )
 
@@ -236,6 +240,10 @@ class LLMService:
         uncached = max(input_tokens - cached, 0)
         cost = (uncached * input_rate + cached * cached_rate + max(output_tokens, 0) * output_rate) / 1_000_000
         return round(cost, 8)
+
+    @staticmethod
+    def estimate_cost_krw(cost_usd: float) -> float:
+        return round(float(cost_usd or 0.0) * USD_KRW_EXCHANGE_RATE, 2)
 
     @staticmethod
     def _collect_response_text(response: Any) -> str:

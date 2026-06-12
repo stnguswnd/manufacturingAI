@@ -1,0 +1,27 @@
+{
+  "header": {
+    "resultMsg": "OK",
+    "resultCode": "00"
+  },
+  "body": {
+    "totalCount": "2",
+    "items": {
+      "item": [
+        {
+          "techGdlnNo": "KOSHA-001",
+          "techGdlnNm": "프레스 방호장치 점검에 관한 기술지침",
+          "techGdlnKnd": "기계",
+          "fileDownlUrl": "https://example.com/kosha001.pdf"
+        },
+        {
+          "techGdlnNo": "KOSHA-002",
+          "techGdlnNm": "작업환경측정 및 소음 관리에 관한 지침",
+          "techGdlnKnd": "보건",
+          "fileDownlUrl": "https://example.com/kosha002.hwp"
+        }
+      ]
+    },
+    "numOfRows": "10",
+    "pageNo": "1"
+  }
+}

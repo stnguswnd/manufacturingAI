@@ -50,3 +50,12 @@
 - Consequences: 정책이 서버에서 강제되므로 UI 우회 요청도 막을 수 있다.
 - Related features: F-004
 
+## ADR-006: User Context Is Supporting Evidence Only
+
+- Date: 2026-06-12
+- Status: accepted
+- Context: 유저별 과거 대화와 memory를 LLM에 넣으면 편의성은 좋아지지만, 과거 정보가 현재 센서값이나 안전 판단을 덮어쓸 위험이 있다.
+- Decision: user context는 supporting evidence로만 사용하고, 현재 입력, 현재 RAG 문서, 현재 safety gate를 최우선으로 둔다.
+- Alternatives: 최근 대화 전체를 prompt에 그대로 삽입.
+- Consequences: context 품질은 더 안정적이지만, ContextBuilder와 MemoryService 구현이 필요하다.
+- Related features: F-005

@@ -1,0 +1,100 @@
+failure_mode_retrieval_policy:
+  OSF:
+    description: "Overstrain Failure / 과부하성 고장 가능성"
+    signals:
+      - torque_nm
+      - tool_wear_min
+    preferred_doc_types:
+      - troubleshooting
+      - safety_standard
+      - korean_machine_safety
+      - korean_maintenance_guidance
+    preferred_safety_gates:
+      - loto
+      - machine_guarding
+      - maintenance_check
+    preferred_sources:
+      - Haas
+      - OSHA
+      - KOSHA
+    blocked_retrieval_scope:
+      - emergency_only
+    notes:
+      - "토크와 공구 마모가 높은 경우 스핀들 부하, 공구 상태, 방호장치, 정비 전 LOTO 확인이 중요하다."
+
+  TWF:
+    description: "Tool Wear Failure / 공구 마모 고장 가능성"
+    signals:
+      - tool_wear_min
+      - torque_nm
+    preferred_doc_types:
+      - troubleshooting
+      - korean_maintenance_guidance
+      - safety_standard
+    preferred_safety_gates:
+      - loto
+      - maintenance_check
+      - machine_guarding
+    preferred_sources:
+      - Haas
+      - OSHA
+      - KOSHA
+    blocked_retrieval_scope:
+      - emergency_only
+
+  HDF:
+    description: "Heat Dissipation Failure / 방열 고장 가능성"
+    signals:
+      - air_temperature_k
+      - process_temperature_k
+    preferred_doc_types:
+      - korean_maintenance_guidance
+      - korean_work_environment_guidance
+      - troubleshooting
+    preferred_safety_gates:
+      - maintenance_check
+      - work_environment_check
+    preferred_sources:
+      - KOSHA
+      - Haas
+    blocked_retrieval_scope:
+      - emergency_only
+    notes:
+      - "온도 관련 질문은 작업환경측정/환기/냉각 관련 문서가 보조 근거가 될 수 있다."
+
+  PWF:
+    description: "Power Failure / 동력계통 고장 가능성"
+    signals:
+      - torque_nm
+      - rotational_speed_rpm
+    preferred_doc_types:
+      - troubleshooting
+      - safety_standard
+      - korean_machine_safety
+    preferred_safety_gates:
+      - loto
+      - maintenance_check
+    preferred_sources:
+      - Haas
+      - OSHA
+      - KOSHA
+    blocked_retrieval_scope:
+      - emergency_only
+
+  emergency:
+    description: "화재, 폭발, 대피, 응급상황"
+    intent_keywords:
+      - 비상
+      - 화재
+      - 폭발
+      - 대피
+      - 응급
+      - 사고
+    preferred_doc_types:
+      - emergency_standard
+      - emergency_guidance
+    preferred_safety_gates:
+      - emergency_action_plan
+    preferred_sources:
+      - OSHA
+    blocked_retrieval_scope: []

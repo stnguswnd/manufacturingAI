@@ -58,8 +58,33 @@ class RagChunk(BaseModel):
 AgentMode = Literal['auto','prediction','knowledge_qa','safety_ops','documentation','hybrid']
 AgentIntent = Literal['prediction','knowledge_qa','safety_ops','documentation','hybrid','general']
 RiskLevel = Literal['low','medium','high','critical','unknown']
+ResolvedTargetType = Literal['concept','equipment','component','failure_mode','process_condition','document','report','previous_answer','unknown']
+QuestionKind = Literal['general_concept_followup','current_state_followup','document_followup','safety_followup','report_followup','comparison_followup','unknown_followup']
+
+class ResolvedTarget(BaseModel):
+    label: str
+    type: ResolvedTargetType = 'unknown'
+    source: str
+    reference_run_id: str | None = None
+    reference_session_id: str | None = None
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+class ReferenceResolutionResult(BaseModel):
+    original_question: str
+    resolved_question: str
+    resolved: bool = False
+    resolved_target: ResolvedTarget | None = None
+    question_kind: QuestionKind = 'unknown_followup'
+    should_use_prediction: bool = False
+    should_use_rag: bool = False
+    should_use_safety: bool = False
+    should_generate_report: bool = False
+    clarification_question: str | None = None
+    reason: str = ''
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 class AgentRequest(BaseModel):
+    user_id: str | None = Field(default=None, max_length=128)
     question: str = Field(default='', max_length=4000)
     process_data: ProcessData | None = None
     inspection_notes: str | None = Field(default=None, max_length=10000)
@@ -68,6 +93,7 @@ class AgentRequest(BaseModel):
     session_id: str | None = Field(default=None, max_length=128)
     mode: AgentMode = 'auto'
     llm_model: str | None = Field(default=None, max_length=80)
+    user_context: dict[str, Any] | None = None
 
 class AgentSendRequest(BaseModel):
     """User-facing message API request.
@@ -76,6 +102,7 @@ class AgentSendRequest(BaseModel):
     It keeps the interface message-centric while still allowing process data,
     inspection notes, and report generation flags.
     """
+    user_id: str = Field(min_length=1, max_length=128)
     message: str = Field(default='', max_length=4000, description='사용자 메시지 또는 질문')
     session_id: str | None = Field(default=None, max_length=128)
     process_data: ProcessData | None = None
@@ -84,6 +111,31 @@ class AgentSendRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=20)
     mode: AgentMode = 'auto'
     llm_model: str | None = Field(default=None, max_length=80)
+
+class UserCreateRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=120)
+    role: str | None = Field(default=None, max_length=120)
+    department: str | None = Field(default=None, max_length=120)
+    preferred_language: str = Field(default='ko', max_length=20)
+    report_style: str = Field(default='standard', max_length=80)
+
+class UserUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=120)
+    role: str | None = Field(default=None, max_length=120)
+    department: str | None = Field(default=None, max_length=120)
+    preferred_language: str | None = Field(default=None, max_length=20)
+    report_style: str | None = Field(default=None, max_length=80)
+
+class UserResponse(BaseModel):
+    user_id: str
+    display_name: str
+    role: str | None = None
+    department: str | None = None
+    preferred_language: str = 'ko'
+    report_style: str = 'standard'
+    created_at: str
+    updated_at: str
+    deleted_at: str | None = None
 
 class AgentTraceStep(BaseModel):
     step: str
@@ -201,6 +253,8 @@ class LLMUsageRecord(BaseModel):
     cached_input_tokens: int = 0
     total_tokens: int = 0
     estimated_cost_usd: float = 0.0
+    estimated_cost_krw: float = 0.0
+    usd_krw_exchange_rate: float = 0.0
     latency_ms: float = 0.0
 
 class LLMUsageSummary(BaseModel):
@@ -211,10 +265,13 @@ class LLMUsageSummary(BaseModel):
     cached_input_tokens: int = 0
     total_tokens: int = 0
     estimated_cost_usd: float = 0.0
+    estimated_cost_krw: float = 0.0
+    usd_krw_exchange_rate: float = 0.0
     records: list[LLMUsageRecord] = []
 
 class AgentResponse(BaseModel):
     run_id: str
+    user_id: str | None = None
     route: list[str]
     answer: str
     prediction: PredictionResponse | None = None
@@ -233,6 +290,7 @@ class AgentResponse(BaseModel):
     llm_model: str | None = None
     llm_usage: LLMUsageSummary | None = None
     llm_error: str | None = None
+    context_used: dict[str, Any] | None = None
 
 class EvaluationRequest(BaseModel):
     agent_answer: str

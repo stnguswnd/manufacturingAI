@@ -4,7 +4,7 @@
 
 | 준비물 | 필수 여부 | 설명 |
 |---|---|---|
-| Python 3.11+ | 필수 | AI Server 실행 |
+| Python 3.12 | 필수 | AI Server 실행 |
 | Java 17 | 선택 | Spring Boot 실행 |
 | Maven | 선택 | Spring Boot 빌드 |
 | 인터넷 연결 | 선택 | 공개 문서 수집 시 필요 |

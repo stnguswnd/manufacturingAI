@@ -3,7 +3,7 @@ from pathlib import Path
 import os
 from dotenv import load_dotenv
 
-AI_SERVER_DIR = Path(__file__).resolve().parents[1]
+AI_SERVER_DIR = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = AI_SERVER_DIR.parent
 
 # Load both project-level and ai_server-level env files.
@@ -24,6 +24,7 @@ MODEL_METRICS = MODEL_DIR / 'ai4i_metrics.json'
 CHUNKS_PATH = VECTOR_DIR / 'chunks.jsonl'
 INDEX_PATH = VECTOR_DIR / 'tfidf_index.joblib'
 HISTORY_DB_PATH = Path(os.getenv('HISTORY_DB_PATH', HISTORY_DIR / 'agent_runs.sqlite3'))
+LANGGRAPH_CHECKPOINT_DB = Path(os.getenv('LANGGRAPH_CHECKPOINT_DB', STORAGE_DIR / 'checkpoints' / 'langgraph_checkpoints.sqlite3'))
 
 APP_NAME = 'Manufacturing Domain AI Agent'
 APP_VERSION = '0.3.0'
@@ -38,16 +39,25 @@ LLM_TIMEOUT_SECONDS = float(os.getenv('LLM_TIMEOUT_SECONDS', '60'))
 LLM_MAX_OUTPUT_TOKENS = int(os.getenv('LLM_MAX_OUTPUT_TOKENS', '1800'))
 LLM_ENABLE_STRUCTURED_OUTPUT = os.getenv('LLM_ENABLE_STRUCTURED_OUTPUT', 'true').strip().lower() in {'1','true','yes','y'}
 LLM_ALLOW_EXPENSIVE_MODELS = os.getenv('LLM_ALLOW_EXPENSIVE_MODELS', 'false').strip().lower() in {'1','true','yes','y'}
+USD_KRW_EXCHANGE_RATE = float(os.getenv('USD_KRW_EXCHANGE_RATE', '1400'))
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '').strip()
 OPENAI_BASE_URL = os.getenv('OPENAI_BASE_URL', '').strip() or None
 OPENAI_ORG_ID = os.getenv('OPENAI_ORG_ID', '').strip() or None
 OPENAI_PROJECT_ID = os.getenv('OPENAI_PROJECT_ID', '').strip() or None
+
+# KOSHA public data API. Keys must be provided only through .env or the shell.
+KOSHA_API_KEY = os.getenv('KOSHA_API_KEY', '').strip()
+KOSHA_CALL_API_ID = os.getenv('KOSHA_CALL_API_ID', '1050').strip()
 
 # Agent runtime controls.
 AGENT_SUPERVISOR_LLM_REFINEMENT = os.getenv('AGENT_SUPERVISOR_LLM_REFINEMENT', 'true').strip().lower() in {'1','true','yes','y'}
 AGENT_MAX_RAG_TOP_K = int(os.getenv('AGENT_MAX_RAG_TOP_K', '8'))
 AGENT_MAX_REPLAN_ATTEMPTS = int(os.getenv('AGENT_MAX_REPLAN_ATTEMPTS', '2'))
 RAG_MIN_NORMALIZED_SCORE = float(os.getenv('RAG_MIN_NORMALIZED_SCORE', '0.05'))
+MAX_CONTEXT_TOKENS = int(os.getenv('MAX_CONTEXT_TOKENS', '2000'))
+MAX_RECENT_RUNS = int(os.getenv('MAX_RECENT_RUNS', '3'))
+MAX_SIMILAR_RUNS = int(os.getenv('MAX_SIMILAR_RUNS', '3'))
+MAX_LONG_TERM_MEMORIES = int(os.getenv('MAX_LONG_TERM_MEMORIES', '5'))
 
 # API protection. Disabled by default for local demos; enable in non-local deployments.
 API_AUTH_ENABLED = os.getenv('API_AUTH_ENABLED', 'false').strip().lower() in {'1','true','yes','y'}
@@ -66,6 +76,8 @@ CORS_ALLOW_ORIGINS = [
 
 # Manufacturing domain configuration files.
 DOMAIN_DIR = Path(os.getenv('DOMAIN_DIR', AI_SERVER_DIR / 'domain'))
+APP_CONFIG_DIR = Path(__file__).resolve().parent
+FAILURE_MODE_RETRIEVAL_POLICY = APP_CONFIG_DIR / 'failure_mode_retrieval_policy.yaml'
 
 # Prices are USD per 1M tokens. Keep this list intentionally small and explicit
 # so expensive models cannot be selected accidentally from the UI/API.

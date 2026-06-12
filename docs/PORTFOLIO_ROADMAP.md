@@ -21,6 +21,7 @@
 | Usage/Cost Tracking | OpenAI usage 기반 토큰/비용 계산 | 실제 운영 비용을 UI와 history에 노출 |
 | Observability | OpenTelemetry span attribute 기록 | 운영 모니터링 확장 가능성 |
 | History | SQLite 기반 실행 이력 저장 | 실행 결과, usage, trace 누적 |
+| User Context | 유저별 profile, session summary, recent runs, long-term memory 구성 | 단순 history injection이 아닌 계층형 context engineering |
 | UI | Streamlit Agent/Prediction/RAG/History 테스트 화면 | 데모 가능한 end-to-end 제품 형태 |
 
 ## 3. 설계에서 고려한 점
@@ -229,4 +230,3 @@ docs/
 ```text
 제조 공정 예측 모델과 문서 RAG, 안전 게이트, Supervisor re-plan 구조를 결합한 제조 특화 AI Agent를 구현했습니다. 단순 챗봇이 아니라 설비/고장모드/위험도/안전 절차/조치 계획을 분리해 reasoning context를 구성하고, OpenAI structured output으로 답변을 생성합니다. 또한 응답 usage 기반 토큰/비용 계산과 OpenTelemetry 관측 포인트를 추가해 실제 운영 비용과 실행 흐름을 UI에서 확인할 수 있게 했습니다.
 ```
-

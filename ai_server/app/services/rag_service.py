@@ -19,7 +19,7 @@ class RagService:
     """
     def __init__(self, chunks_path: Path | None = None, index_path: Path | None = None):
         self.chunks_path = chunks_path or CHUNKS_PATH
-        self.index_path = index_path  # kept for backward-compatible constructor signature
+        self.index_path = index_path
         self.chunks: list[dict] = []
         self._doc_tokens: list[Counter[str]] = []
         self._doc_lengths: list[int] = []

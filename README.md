@@ -138,6 +138,7 @@ manufacturing_ai_agent_domain_fastapi/
 | `docs/ARCHITECTURE_DECISIONS.md` | 주요 설계 판단 기록 |
 | `docs/QUALITY_CHECKLIST.md` | 기능 추가 전후 검증 체크리스트 |
 | `docs/DEMO_SCRIPT.md` | 포트폴리오 시연 순서 |
+| `docs/USER_CONTEXT_ENGINEERING_PLAN.md` | 유저 생성/삭제와 유저별 context engineering 기획 |
 
 ---
 
@@ -170,11 +171,26 @@ LLM_MODEL=your-model-name
 
 ---
 
+## 4.1 LangGraph Checkpoint / Session Memory
+
+Local/MVP 환경에서는 SQLite persistent checkpointer를 사용합니다.
+
+```text
+기본 경로: ai_server/storage/checkpoints/langgraph_checkpoints.sqlite3
+thread_id: user_id:session_id
+```
+
+같은 `user_id + session_id`로 들어온 요청은 서버 재시작 후에도 short-term conversation state를 복원할 수 있습니다. 반대로 다른 `user_id`가 같은 `session_id`를 쓰거나, 같은 사용자가 다른 `session_id`를 쓰면 대화 초점과 이전 공정 데이터가 섞이지 않도록 `thread_id`를 분리합니다.
+
+운영 환경에서 동시 요청이 많아지면 SQLite 대신 Postgres 또는 Redis 기반 checkpointer로 전환하고, lock과 connection pooling 정책을 별도로 설계해야 합니다.
+
+---
+
 ## 5. 빠른 실행
 
 ```bash
 cd manufacturing_ai_agent_domain_fastapi/ai_server
-python -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
@@ -189,6 +205,82 @@ API 문서:
 ```text
 http://localhost:8000/docs
 ```
+
+---
+
+## 5.1 RAG 문서 수집/정제 파이프라인
+
+AI4I CSV는 예측 모델, fixture, `process_data` 예시 용도입니다. AI4I CSV row를 Vector DB에 넣지 않습니다. Vector DB에는 AI4I 예측 결과를 정비 절차, 안전 확인, 보고서 문구로 바꿔줄 OSHA/Haas/KOSHA 문서만 넣습니다.
+
+환경변수:
+
+```bash
+cp .env.example .env
+```
+
+`.env`에 KOSHA 공공데이터 API 키를 넣습니다.
+
+```env
+KOSHA_API_KEY=
+KOSHA_CALL_API_ID=1050
+```
+
+설치:
+
+```bash
+pip install -r ai_server/requirements.txt
+```
+
+실행 순서:
+
+```bash
+python ai_server/scripts/download_static_rag_sources.py
+python ai_server/scripts/download_kosha_sources.py --num-rows 20 --pages 1
+python ai_server/scripts/build_rag_documents.py
+python ai_server/scripts/build_rag_chunks.py
+python ai_server/scripts/inspect_rag_corpus.py
+```
+
+secondary keywords까지 포함:
+
+```bash
+python ai_server/scripts/download_kosha_sources.py --include-secondary --num-rows 20 --pages 1
+```
+
+더 많이 수집:
+
+```bash
+python ai_server/scripts/download_kosha_sources.py --include-secondary --num-rows 50 --pages 3
+```
+
+생성 산출물:
+
+```text
+ai_server/data/processed/kosha_download_index.json
+ai_server/data/processed/kosha_download_index.jsonl
+ai_server/data/processed/rag_documents.jsonl
+ai_server/data/processed/rag_chunks.jsonl
+ai_server/data/processed/rag_corpus_report.md
+```
+
+주의사항:
+
+```text
+- AI4I CSV는 모델 예측/fixture/process_data 용도이며 Vector DB에 넣지 않는다.
+- OSHA/Haas/KOSHA 문서는 RAG 근거용이다.
+- KOSHA는 넓게 수집할 수 있지만, 검색 노이즈를 막기 위해 project_priority와 retrieval_scope metadata를 반드시 사용한다.
+- KOSHA의 일부 HWP 파일은 자동 텍스트 추출이 실패할 수 있다.
+- 텍스트 추출 실패 문서는 metadata-only로 남기고 기본 chunking 대상에서 제외한다.
+- 실제 답변에서 KOSHA GUIDE는 국내 기술지침/참고자료 성격으로 사용하고, 법적 보증처럼 표현하지 않는다.
+```
+
+Optional Chroma indexing:
+
+```bash
+python ai_server/scripts/index_rag_chunks_chroma.py
+```
+
+Chroma는 선택 사항입니다. 기본 완료 기준은 `rag_documents.jsonl`, `rag_chunks.jsonl`, `rag_corpus_report.md` 생성입니다.
 
 ---
 
@@ -348,6 +440,32 @@ curl -X POST http://localhost:8000/evaluation/score \
 
 4. AI는 설비 제어를 하지 않는다.
    정비 실행, 안전 보증, 법적 판단은 담당자가 최종 확인해야 한다.
+```
+
+### Future Work
+
+이번 MVP 안정화 단계에서는 아래 작업을 의도적으로 구현하지 않고 확장 과제로 남깁니다.
+
+```text
+1. RAG 고도화
+   - rag_query_planner
+   - document_retriever
+   - evidence_filter
+   - evidence_grader
+   - citation_builder
+   - retrieval_replan
+
+2. Safety 고도화
+   - gate_builder
+   - constraint_injector
+   - action_validator
+   - answer_validator
+   - report_validator
+   - escalation_decision
+
+3. 운영 checkpointer 전환
+   - SQLite에서 Postgres/Redis checkpointer로 전환
+   - 동시 요청, lock, connection pooling 고려
 ```
 
 ---

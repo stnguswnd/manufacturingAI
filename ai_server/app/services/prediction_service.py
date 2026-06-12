@@ -76,7 +76,10 @@ class PredictionService:
             try:
                 self.bundle = joblib.load(self.model_path)
             except Exception as exc:
-                raise ModelNotReadyError('Prediction model bundle cannot be loaded') from exc
+                if self.csv_path.exists():
+                    self.bundle = self.train()
+                    return self.bundle
+                raise ModelNotReadyError('Prediction model bundle cannot be loaded and AI4I CSV is missing') from exc
             return self.bundle
         self.bundle = self.train()
         return self.bundle

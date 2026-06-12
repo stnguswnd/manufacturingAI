@@ -6,13 +6,6 @@ from app.config import AGENT_SUPERVISOR_LLM_REFINEMENT
 from app.schemas import AgentLayer, AgentPlan, AgentRequest, LLMUsageRecord
 from app.services.llm_service import LLMService, PLAN_SCHEMA
 
-SAFETY_KEYWORDS = ['안전','비상','대피','loto','lockout','tagout','방호','가드','회전부','인터록','정비 전','위험','보호구','비상정지','전기','제어반']
-REPORT_KEYWORDS = ['보고서','문서화','정리','초안','점검 결과','리포트','요약','기록']
-PREDICTION_KEYWORDS = ['토크','공구','마모','온도','회전수','rpm','불량','고장','고장모드','위험도','예측','공정 데이터','air temperature','torque','tool wear']
-KNOWLEDGE_KEYWORDS = ['매뉴얼','문서','기술문서','도면','p&id','pid','g-code','m-code','설정','트러블슈팅','예방정비','점검','절차']
-ASSET_KEYWORDS = ['cnc','스핀들','spindle','tool changer','공구교환','냉각','냉각수','펌프','제어반','서보','모터','인터록','비상정지']
-MAINTENANCE_KEYWORDS = ['정비','점검','교체','수리','분해','maintenance','repair','replace']
-
 class SupervisorService:
     """Manufacturing-specific hierarchical supervisor.
 
@@ -27,6 +20,8 @@ class SupervisorService:
 
     def plan(self, req: AgentRequest, usage_callback: Callable[[LLMUsageRecord], None] | None = None) -> AgentPlan:
         base = self._deterministic_plan(req)
+        if self._resolved_turn(req):
+            return base
         if not AGENT_SUPERVISOR_LLM_REFINEMENT:
             return base
         refined = self._llm_refine(req, base, usage_callback=usage_callback)
@@ -109,64 +104,59 @@ class SupervisorService:
         )
 
     def _deterministic_plan(self, req: AgentRequest) -> AgentPlan:
-        q = (req.question or '').lower()
-        mode = req.mode
-        prediction_required = bool(req.process_data) or mode == 'prediction' or any(k.lower() in q for k in PREDICTION_KEYWORDS)
-        safety_required = mode == 'safety_ops' or any(k.lower() in q for k in SAFETY_KEYWORDS) or any(k.lower() in q for k in MAINTENANCE_KEYWORDS)
-        report_required = bool(req.generate_report or req.inspection_notes) or mode == 'documentation' or any(k.lower() in q for k in REPORT_KEYWORDS)
-        knowledge_required = mode == 'knowledge_qa' or any(k.lower() in q for k in KNOWLEDGE_KEYWORDS)
-        asset_context_required = bool(req.process_data) or any(k.lower() in q for k in ASSET_KEYWORDS + KNOWLEDGE_KEYWORDS + SAFETY_KEYWORDS + PREDICTION_KEYWORDS)
-        process_condition_required = prediction_required and bool(req.process_data)
-        failure_mode_required = prediction_required
-        safety_gate_required = safety_required or any(k.lower() in q for k in MAINTENANCE_KEYWORDS) or prediction_required
-        action_plan_required = prediction_required or safety_required or knowledge_required or report_required
-        # RAG is valuable for any manufacturing answer except pure prediction-only mode.
-        rag_required = bool(req.question) and (knowledge_required or safety_required or report_required or prediction_required or mode in {'auto','hybrid'})
-        if mode == 'hybrid':
-            prediction_required = prediction_required or bool(req.process_data)
-            rag_required = True
-            safety_gate_required = True
-            action_plan_required = True
-        if mode == 'prediction' and not safety_required and not report_required and not knowledge_required:
-            # Prediction still uses domain catalogs, but can skip retrieval if the user asked only numeric prediction.
-            rag_required = False if '문서' not in q and '점검' not in q and '조치' not in q else rag_required
+        from app.agent.heavy.diagnostic_planner import DiagnosticFallbackPolicy
 
-        intent = self._intent(prediction_required, safety_required, report_required, knowledge_required, rag_required)
-        document_scope = self._document_scope(prediction_required, safety_required, report_required, knowledge_required)
-        query = self._build_query(req, document_scope)
+        diagnostic = DiagnosticFallbackPolicy().plan(req)
+        intent = self._intent(
+            diagnostic.requires_prediction,
+            diagnostic.requires_safety,
+            diagnostic.requires_report,
+            diagnostic.requires_knowledge,
+            diagnostic.requires_rag,
+        )
         layers = self._layers(
-            asset_context_required=asset_context_required,
-            process_condition_required=process_condition_required,
-            failure_mode_required=failure_mode_required,
+            asset_context_required=diagnostic.requires_asset_context,
+            process_condition_required=diagnostic.requires_process_condition,
+            failure_mode_required=diagnostic.requires_failure_mode,
             risk_priority_required=True,
-            rag_required=rag_required,
-            safety_gate_required=safety_gate_required,
-            action_plan_required=action_plan_required,
-            report_required=report_required,
+            rag_required=diagnostic.requires_rag,
+            safety_gate_required=diagnostic.requires_safety_gate,
+            action_plan_required=diagnostic.requires_action_plan,
+            report_required=diagnostic.requires_report,
         )
         required_nodes = [node for layer in layers for node in layer.nodes]
         return AgentPlan(
             intent=intent,
-            confidence=0.82,
-            prediction_required=prediction_required,
-            rag_required=rag_required,
-            safety_required=safety_required,
-            report_required=report_required,
+            confidence=diagnostic.confidence,
+            prediction_required=diagnostic.requires_prediction,
+            rag_required=diagnostic.requires_rag,
+            safety_required=diagnostic.requires_safety,
+            report_required=diagnostic.requires_report,
             domain_context_required=True,
-            asset_context_required=asset_context_required,
-            process_condition_required=process_condition_required,
-            failure_mode_required=failure_mode_required,
+            asset_context_required=diagnostic.requires_asset_context,
+            process_condition_required=diagnostic.requires_process_condition,
+            failure_mode_required=diagnostic.requires_failure_mode,
             risk_priority_required=True,
-            safety_gate_required=safety_gate_required,
-            action_plan_required=action_plan_required,
+            safety_gate_required=diagnostic.requires_safety_gate,
+            action_plan_required=diagnostic.requires_action_plan,
             required_nodes=required_nodes,
             layers=layers,
-            rag_query=query,
+            rag_query=diagnostic.rag_query,
             rag_filters=None,
-            document_scope=document_scope,
-            rationale='제조 업무 흐름 기반 규칙: 설비 식별 → 공정조건 → 고장모드 → 위험도 → 문서검색 → 안전게이트 → 조치계획 순서로 실행 계획을 구성했습니다.',
+            document_scope=diagnostic.document_scope,
+            rationale=diagnostic.reason,
             supervisor_source='deterministic',
         )
+
+    @staticmethod
+    def _resolved_turn(req: AgentRequest) -> dict:
+        current_turn = (req.user_context or {}).get('current_turn') or {}
+        if not isinstance(current_turn, dict):
+            return {}
+        reason = current_turn.get('reason')
+        if current_turn.get('resolved') or current_turn.get('clarification_question') or reason not in {None, '', 'not_followup'}:
+            return current_turn
+        return {}
 
     def _llm_refine(self, req: AgentRequest, base: AgentPlan, usage_callback: Callable[[LLMUsageRecord], None] | None = None) -> AgentPlan | None:
         payload = {

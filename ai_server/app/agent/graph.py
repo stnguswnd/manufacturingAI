@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import re
 from typing import Callable
 from uuid import uuid4
 
-from app.config import AGENT_MAX_RAG_TOP_K, AGENT_MAX_REPLAN_ATTEMPTS, LLM_PROVIDER
+from app.config import AGENT_MAX_RAG_TOP_K, AGENT_MAX_REPLAN_ATTEMPTS, LLM_PROVIDER, USD_KRW_EXCHANGE_RATE
+from app.agent.heavy import CitationBuilder, DiagnosticPlanner, EvidenceFilter, EvidenceGrader, RagQueryPlanner, RecommendationBuilder, SafetyGateBuilder, StructuredAnswerPayloadBuilder
 from app.errors import LLMUnavailableError, UnsafeResponseError
 from app.schemas import AgentRequest, AgentResponse, AgentTraceStep, LLMUsageRecord, LLMUsageSummary, ManufacturingContext, PredictionResponse, RagChunk
 from app.services.domain_service import DomainKnowledgeService
@@ -38,9 +38,17 @@ class ManufacturingAgentGraph:
         self.report_service = ReportService()
         self.llm_service = llm_service or LLMService()
         self.supervisor = SupervisorService(self.llm_service)
+        self.diagnostic_planner = DiagnosticPlanner(self.supervisor)
         self.domain_service = DomainKnowledgeService()
         self.store = JsonLineStore()
         self.safety_validator = SafetyValidationService()
+        self.rag_query_planner = RagQueryPlanner()
+        self.evidence_filter = EvidenceFilter()
+        self.evidence_grader = EvidenceGrader()
+        self.citation_builder = CitationBuilder()
+        self.safety_gate_builder = SafetyGateBuilder()
+        self.recommendation_builder = RecommendationBuilder()
+        self.structured_payload_builder = StructuredAnswerPayloadBuilder()
 
     def run(self, req: AgentRequest, progress_callback: Callable[[AgentTraceStep], None] | None = None) -> AgentResponse:
         run_id = str(uuid4())
@@ -59,7 +67,8 @@ class ManufacturingAgentGraph:
             emit('LLM Usage Meter', f'{record.operation}: input={record.input_tokens}, output={record.output_tokens}, cached={record.cached_input_tokens}, cost=${record.estimated_cost_usd:.6f}')
 
         emit('Input Normalizer', '사용자 질문, 공정 데이터, 점검 메모를 표준 상태로 정리했습니다.')
-        plan = self.supervisor.plan(req, usage_callback=collect_usage)
+        planning_result = self.diagnostic_planner.plan(request=req, usage_callback=collect_usage)
+        plan = planning_result.agent_plan
         route = list(plan.required_nodes)
         emit('Manufacturing Supervisor / Router', f'의도={plan.intent}, source={plan.supervisor_source}, rationale={plan.rationale}')
 
@@ -80,26 +89,42 @@ class ManufacturingAgentGraph:
             emit('Failure Mode Agent', '고장모드 후보: ' + ', '.join(f'{f.code}({f.name_ko})' for f in manufacturing_context.failure_modes))
         emit('Risk & Priority Agent', f'종합 우선순위={manufacturing_context.risk_assessment.overall_priority}, escalation={manufacturing_context.risk_assessment.escalation_required}')
 
-        query = self._make_rag_query(req, plan.rag_query, prediction, manufacturing_context)
+        retrieval_request = self.rag_query_planner.plan(
+            request=req,
+            planned_query=plan.rag_query,
+            prediction=prediction,
+            manufacturing_context=manufacturing_context,
+            top_k=min(max(req.top_k or 5, 1), AGENT_MAX_RAG_TOP_K),
+            filters=plan.rag_filters,
+        )
+        query = retrieval_request.query
         contexts: list[RagChunk] = []
         if plan.rag_required:
-            top_k = min(max(req.top_k or 5, 1), AGENT_MAX_RAG_TOP_K)
-            contexts = self.rag_service.search(query, top_k=top_k, filters=plan.rag_filters)
+            contexts = self.evidence_filter.filter(self.rag_service.search(query, top_k=retrieval_request.top_k, filters=retrieval_request.filters))
             emit('Procedure Retrieval Agent', f'문서 검색을 실행했습니다. query={query[:200]}')
 
         replan_attempt = 0
-        weak_contexts = bool(contexts) and not self._contexts_match_user_terms(req.question, contexts)
+        evidence_grade = self.evidence_grader.grade(req.question, contexts)
+        weak_contexts = bool(contexts) and not evidence_grade.usable
         while plan.rag_required and (not contexts or weak_contexts) and replan_attempt < AGENT_MAX_REPLAN_ATTEMPTS:
             replan_attempt += 1
             findings = ['RAG 검색 결과가 없어 근거 문서와 citation 신뢰도가 부족합니다.'] if not contexts else ['검색 문서는 있으나 사용자 원문과 직접 겹치는 핵심어가 부족합니다.']
-            plan = self.supervisor.replan(req, plan, findings, attempt=replan_attempt)
+            plan = self.diagnostic_planner.replan(req, plan, findings, attempt=replan_attempt)
             route = list(plan.required_nodes)
             emit('Supervisor Re-plan', f'근거 부족으로 재계획했습니다. attempt={replan_attempt}, rationale={plan.rationale}')
-            query = self._make_rag_query(req, plan.rag_query, prediction, manufacturing_context)
-            top_k = min(max(req.top_k or 5, 1), AGENT_MAX_RAG_TOP_K)
-            contexts = self.rag_service.search(query, top_k=top_k, filters=plan.rag_filters)
+            retrieval_request = self.rag_query_planner.plan(
+                request=req,
+                planned_query=plan.rag_query,
+                prediction=prediction,
+                manufacturing_context=manufacturing_context,
+                top_k=min(max(req.top_k or 5, 1), AGENT_MAX_RAG_TOP_K),
+                filters=plan.rag_filters,
+            )
+            query = retrieval_request.query
+            contexts = self.evidence_filter.filter(self.rag_service.search(query, top_k=retrieval_request.top_k, filters=retrieval_request.filters))
             emit('Procedure Retrieval Agent', f'재계획 query로 문서 검색을 다시 실행했습니다. query={query[:200]}')
-            weak_contexts = bool(contexts) and not self._contexts_match_user_terms(req.question, contexts)
+            evidence_grade = self.evidence_grader.grade(req.question, contexts)
+            weak_contexts = bool(contexts) and not evidence_grade.usable
         if weak_contexts:
             contexts = []
             emit('Procedure Retrieval Agent', '재계획 후에도 사용자 질문과 직접 연결되는 문서 근거가 부족해 citation 후보를 제외했습니다.')
@@ -111,20 +136,29 @@ class ManufacturingAgentGraph:
         if manufacturing_context.action_plan:
             emit('Action Planner Agent', '조치 계획: ' + ' → '.join(a.label_ko for a in manufacturing_context.action_plan[:5]))
 
-        actions = self._collect_action_phrases(prediction, manufacturing_context)
-        safety_guidance = self._safety_guidance(manufacturing_context) if manufacturing_context.safety_gates else None
+        actions = self.recommendation_builder.collect_action_phrases(prediction, manufacturing_context)
+        safety_guidance = self.safety_gate_builder.safety_guidance(manufacturing_context) if manufacturing_context.safety_gates else None
         if safety_guidance:
             emit('Safety Ops Agent', '안전 게이트 기반 안전 안내를 생성했습니다.')
 
         answer = None
         report = None
         llm_used = False
-        warnings = self._warnings(manufacturing_context)
+        warnings = self.safety_gate_builder.warnings(manufacturing_context)
         if prediction and prediction.input_warnings:
             warnings.extend(prediction.input_warnings)
         audit_feedback: list[str] = []
         for llm_attempt in range(AGENT_MAX_REPLAN_ATTEMPTS + 1):
-            llm_payload = self._llm_payload(req, plan, prediction, manufacturing_context, contexts, actions, safety_guidance, audit_feedback=audit_feedback)
+            llm_payload = self.structured_payload_builder.build(
+                request=req,
+                plan=plan,
+                prediction=prediction,
+                manufacturing_context=manufacturing_context,
+                contexts=contexts,
+                action_titles=actions,
+                safety_guidance=safety_guidance,
+                audit_feedback=audit_feedback,
+            )
             llm_result = self.llm_service.generate_json(
                 schema_name='manufacturing_domain_agent_response',
                 schema=ANSWER_SCHEMA,
@@ -156,7 +190,7 @@ class ManufacturingAgentGraph:
                 report = None
                 llm_used = False
                 if llm_attempt < AGENT_MAX_REPLAN_ATTEMPTS:
-                    plan = self.supervisor.replan(req, plan, validation.errors, attempt=llm_attempt + 1)
+                    plan = self.diagnostic_planner.replan(req, plan, validation.errors, attempt=llm_attempt + 1)
                     route = list(plan.required_nodes)
                     emit('Safety Validator', 'LLM 답변이 안전 검증을 통과하지 못했습니다. Supervisor에 재계획을 요청합니다.')
                     emit('Supervisor Re-plan', f'안전 검증 실패를 반영해 재계획했습니다. attempt={llm_attempt + 1}, findings={"; ".join(validation.errors[:3])}')
@@ -168,7 +202,7 @@ class ManufacturingAgentGraph:
             retryable = llm_error and any(token in llm_error.lower() for token in ['json', 'schema', 'unterminated', 'parse'])
             if retryable and llm_attempt < AGENT_MAX_REPLAN_ATTEMPTS:
                 audit_feedback = [f'LLM structured output parse failed: {llm_error}']
-                plan = self.supervisor.replan(req, plan, audit_feedback, attempt=llm_attempt + 1)
+                plan = self.diagnostic_planner.replan(req, plan, audit_feedback, attempt=llm_attempt + 1)
                 route = list(plan.required_nodes)
                 emit('Supervisor Re-plan', f'LLM 출력 파싱 실패를 반영해 재계획했습니다. attempt={llm_attempt + 1}')
                 continue
@@ -188,11 +222,12 @@ class ManufacturingAgentGraph:
             emit('Report Agent', '제조 도메인 템플릿 기반 점검/정비 보고서 초안을 생성했습니다.')
 
         emit('Evaluation / Audit Agent', '안전 게이트, 금지 표현, 담당자 검토 필요 여부를 응답 metadata에 기록했습니다.')
-        citations = self.report_service.citations(contexts)
+        citations = self.citation_builder.build(contexts, evidence_grade if contexts else None)
         replan_count = sum(1 for item in trace if item.step == 'Supervisor Re-plan')
         usage_summary = self._usage_summary(usage_records, replan_count=replan_count)
         response = AgentResponse(
             run_id=run_id,
+            user_id=req.user_id,
             session_id=req.session_id,
             route=route,
             answer=answer,
@@ -211,6 +246,7 @@ class ManufacturingAgentGraph:
             llm_model=req.llm_model or self.llm_service.model,
             llm_usage=usage_summary,
             llm_error=llm_error,
+            context_used=self._context_metadata(req.user_context, req.user_id),
         )
         record_agent_run_span(
             run_id=run_id,
@@ -219,8 +255,9 @@ class ManufacturingAgentGraph:
             llm_model=req.llm_model or self.llm_service.model,
             llm_used=llm_used,
             usage=usage_summary,
+            context_used=response.context_used or {},
         )
-        self.store.append({'run_id': run_id, 'session_id': req.session_id, 'request': req.model_dump(), 'response': response.model_dump()})
+        self.store.append({'run_id': run_id, 'user_id': req.user_id, 'session_id': req.session_id, 'request': req.model_dump(), 'response': response.model_dump()})
         return response
 
     @staticmethod
@@ -233,109 +270,37 @@ class ManufacturingAgentGraph:
             cached_input_tokens=sum(r.cached_input_tokens for r in records),
             total_tokens=sum(r.total_tokens for r in records),
             estimated_cost_usd=round(sum(r.estimated_cost_usd for r in records), 8),
+            estimated_cost_krw=round(sum(r.estimated_cost_krw for r in records), 2),
+            usd_krw_exchange_rate=USD_KRW_EXCHANGE_RATE,
             records=records,
         )
-
-    def _make_rag_query(self, req: AgentRequest, planned_query: str, prediction: PredictionResponse | None, mfg: ManufacturingContext) -> str:
-        parts = [planned_query or req.question or '']
-        if prediction:
-            parts.extend(prediction.predicted_modes)
-            parts.extend([e.feature for e in prediction.evidence_features])
-            parts.extend(prediction.recommended_actions[:4])
-        parts.extend(mfg.document_search_terms)
-        if req.inspection_notes:
-            parts.append(req.inspection_notes)
-        return ' '.join(p for p in parts if p).strip() or 'manufacturing safety maintenance troubleshooting'
-
-    @staticmethod
-    def _contexts_match_user_terms(question: str, contexts: list[RagChunk]) -> bool:
-        stopwords = {
-            'the', 'and', 'for', 'with', 'what', 'how',
-            '어떤', '있어', '대한', '알려줘', '찾아줘', '확인', '점검', '절차',
-            '제조', '관련', '질의', '질문', '해야', '하는지',
-        }
-        terms: set[str] = set()
-        for token in re.findall(r'[가-힣A-Za-z0-9_+#.-]+', question or ''):
-            lowered = token.lower()
-            stripped = lowered.rstrip('이가은는을를에의와과도')
-            is_korean = bool(re.search(r'[가-힣]', lowered))
-            if lowered in stopwords or stripped in stopwords:
-                continue
-            if (is_korean and len(stripped) >= 2) or (not is_korean and len(stripped) >= 3):
-                terms.add(stripped)
-        if not terms:
-            return True
-        blob = ' '.join([f'{c.document_title} {c.text} {c.source} {c.section or ""} {c.doc_type or ""}' for c in contexts]).lower()
-        return any(term in blob for term in terms)
-
-    @staticmethod
-    def _collect_action_phrases(prediction: PredictionResponse | None, mfg: ManufacturingContext) -> list[str]:
-        actions = [a.output_phrase for a in mfg.action_plan if a.output_phrase]
-        if prediction:
-            actions.extend(prediction.recommended_actions)
-        # Add safety gate checks as action-like items.
-        for gate in mfg.safety_gates:
-            actions.append(f'{gate.name_ko}: ' + '; '.join(gate.required_checks[:3]))
-        return list(dict.fromkeys(actions)) or ['추가 데이터와 관련 문서를 확인한 뒤 담당자가 점검 여부를 판단하세요.']
-
-    @staticmethod
-    def _safety_guidance(mfg: ManufacturingContext) -> str:
-        lines: list[str] = []
-        for gate in mfg.safety_gates:
-            lines.append(f'### {gate.name_ko}')
-            lines.append(f'- 위험도: {gate.severity}')
-            lines.append(f'- 설명: {gate.description_ko}')
-            for check in gate.required_checks:
-                lines.append(f'- 확인: {check}')
-            for forbidden in gate.forbidden_agent_actions[:3]:
-                lines.append(f'- 금지: {forbidden}')
-            if gate.escalation:
-                lines.append(f'- Escalation: {gate.escalation}')
-            lines.append('')
-        return '\n'.join(lines).strip()
-
-    @staticmethod
-    def _warnings(mfg: ManufacturingContext) -> list[str]:
-        warnings = ['실제 설비 제어/정비 실행/법적 안전 판단을 대체하지 않습니다.']
-        warnings.extend(mfg.audit_notes)
-        forbidden = []
-        for gate in mfg.safety_gates:
-            forbidden.extend(gate.forbidden_agent_actions)
-        if forbidden:
-            warnings.append('응답 생성 시 금지 표현: ' + '; '.join(list(dict.fromkeys(forbidden))[:6]))
-        return list(dict.fromkeys(warnings))
 
     @staticmethod
     def _answer_system_prompt(report_required: bool) -> str:
         report_rule = '보고서 초안이 필요한 경우 report 필드에 Markdown 형식으로 작성하세요.' if report_required else '보고서가 필요하지 않으면 report는 null로 두세요.'
         return (
             '당신은 제조 품질/설비 문서 기반 AI Agent입니다. '
-            '반드시 제공된 prediction, manufacturing_context, rag_contexts, actions 안의 사실만 사용하세요. '
+            '현재 질문이 정의, 장단점, 한계, 원리 같은 일반 기술 개념을 묻는 경우에는 일반 제조/기계 지식으로 설명할 수 있지만, 현재 설비 상태나 센서값은 단정하지 마세요. '
+            '현재 현장 판단, 고장 확률, 안전 판단은 반드시 제공된 prediction, manufacturing_context, rag_contexts, actions 안의 사실에 근거하세요. '
             'manufacturing_context.safety_gates의 required_checks는 누락하지 말고, forbidden_agent_actions는 절대 수행했다고 말하지 마세요. '
             '제공되지 않은 센서, 현장 이력, 법적 판단, 확률을 지어내지 마세요. '
+            'user_context는 참고 정보이며 현재 입력된 공정 데이터, 현재 검색된 문서, 현재 safety gate보다 우선할 수 없습니다. '
+            '과거 context에 근거해 현재 센서값, 현장 상태, 안전 상태를 단정하지 말고, 관련 없는 과거 context는 사용하지 마세요. '
             '설비를 자동 정지/제어/수리했다고 말하지 말고 담당자 점검 권고로 표현하세요. '
             'answer는 한국어 Markdown으로 판정, 주요 근거, 위험도, 안전 확인, 권장 조치, 주의 사항 섹션을 포함하세요. '
             f'{report_rule}'
         )
 
     @staticmethod
-    def _llm_payload(req: AgentRequest, plan, prediction: PredictionResponse | None, mfg: ManufacturingContext, contexts: list[RagChunk], actions: list[str], safety_guidance: str | None, audit_feedback: list[str] | None = None) -> dict:
+    def _context_metadata(context: dict | None, user_id: str | None = None) -> dict | None:
+        if not context:
+            return None
         return {
-            'question': req.question,
-            'inspection_notes': req.inspection_notes,
-            'process_data': req.process_data.model_dump() if req.process_data else None,
-            'plan': plan.model_dump() if plan else None,
-            'prediction': prediction.model_dump() if prediction else None,
-            'manufacturing_context': mfg.model_dump(),
-            'rag_contexts': [c.model_dump() for c in contexts],
-            'recommended_actions': actions,
-            'safety_guidance': safety_guidance,
-            'audit_feedback': audit_feedback or [],
-            'output_policy': {
-                'language': 'ko',
-                'sections': ['판정', '주요 근거', '위험도', '안전 확인', '권장 조치', '주의 사항'],
-                'must_include_citations': True,
-                'no_equipment_control': True,
-                'must_respect_safety_gates': True,
-            },
+            'user_id': user_id,
+            'session_id': (context.get('session_context') or {}).get('session_id'),
+            'recent_runs_count': len(context.get('recent_runs') or []),
+            'similar_runs_count': len(context.get('similar_runs') or []),
+            'memories_count': len(context.get('long_term_memory') or []),
+            'estimated_context_tokens': context.get('estimated_context_tokens', 0),
+            'context_policy': context.get('context_policy') or {},
         }
