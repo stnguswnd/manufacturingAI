@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from app.agent.artifacts import EvidenceArtifact
 from app.agent.heavy.citation_builder import CitationBuilder
 from app.agent.heavy.evidence_filter import EvidenceFilter
 from app.agent.heavy.evidence_grader import EvidenceGrader
@@ -151,6 +152,10 @@ def build_payload(state: RagEvidenceState, deps: RagEvidenceDeps) -> RagEvidence
     trace.update({
         'selected_count': len(selected),
         'citation_count': len(citations),
+        'citation_coverage_ok': len(citations) == len(selected),
+        'selected_chunk_ids_unique': len({chunk.chunk_id for chunk in selected if chunk.chunk_id}) == len([chunk for chunk in selected if chunk.chunk_id]),
+        'selected_doc_ids_unique': len({_doc_key(chunk) for chunk in selected}) == len(selected),
+        'evidence_grade_selected_consistent': grade.usable or (not selected and not citations),
         'selected_sources': _unique([chunk.source for chunk in selected]),
         'selected_safety_gates': _unique([chunk.safety_gate for chunk in selected if chunk.safety_gate]),
         'evidence_judge': _evidence_judge_decision(selected, profile=profile, plan=plan, context=context),
@@ -189,13 +194,31 @@ def build_trace(state: RagEvidenceState, deps: RagEvidenceDeps) -> RagEvidenceSt
         'corpus_count_mismatch': bool(mismatch),
         'warnings': list(dict.fromkeys(warnings)),
     })
+    state_with_final_diagnostics = {
+        **state,
+        'trace': trace,
+        'warnings': trace['warnings'],
+    }
     grade = EvidenceGrade.model_validate(state.get('evidence_grade') or {'usable': False, 'weak_reason': 'no_grade'})
+    evidence_artifact = _evidence_artifact(
+        state=state_with_final_diagnostics,
+        grade=grade,
+        selected=selected,
+        citations=citations,
+    )
+    trace['evidence_artifact'] = {
+        'profile': evidence_artifact.profile,
+        'required_safety_gates': evidence_artifact.required_safety_gates,
+        'evidence_covers_required_gates': evidence_artifact.evidence_covers_required_gates,
+        'missing_gate_evidence': evidence_artifact.missing_gate_evidence,
+    }
     output = {
         'plan': state['plan'],
         'route': list((state.get('plan') or {}).get('required_nodes') or []),
         'retrieved_documents': state.get('selected_chunks') or [],
         'citations': state.get('citations') or [],
         'evidence_grade': grade.model_dump(),
+        'evidence_artifact': evidence_artifact.model_dump(),
         'manufacturing_context': state['manufacturing_context'],
         'warnings': trace['warnings'],
         'trace': trace,
@@ -480,11 +503,69 @@ def _evidence_judge_decision(selected: list[RagChunk], *, profile: str, plan: Ag
         title_blob = _chunk_title_blob(first)
         if not any(term in title_blob for term in title_terms):
             reasons.append('top_evidence_low_title_directness')
+    for chunk in selected:
+        if not chunk.text.strip():
+            reasons.append('selected_evidence_missing_text')
+        if not (chunk.doc_id or chunk.document_title or chunk.title):
+            reasons.append('selected_evidence_missing_doc_identity')
+        scope = (chunk.retrieval_scope or '').strip().lower()
+        if scope == 'emergency_only' and profile != 'rag_only_safety':
+            reasons.append('emergency_only_evidence_selected_without_emergency_profile')
     return {
         'called': False,
         'reason': 'deterministic_confident' if not reasons else 'ambiguous_top_candidates',
-        'would_call_on': reasons,
+        'would_call_on': list(dict.fromkeys(reasons)),
     }
+
+
+def _evidence_artifact(*, state: RagEvidenceState, grade: EvidenceGrade, selected: list[RagChunk], citations: list[dict[str, Any]]) -> EvidenceArtifact:
+    plan = AgentPlan.model_validate(state['plan'])
+    context = ManufacturingContext.model_validate(state['manufacturing_context'])
+    query_specs = state.get('query_specs') or []
+    required_gates = [gate.gate_id for gate in context.safety_gates] if (plan.safety_required or plan.safety_gate_required) else []
+    covered_gates = {
+        gate.gate_id
+        for gate in context.safety_gates
+        if any(_matches_gate_context(chunk, gate) for chunk in selected)
+    }
+    missing_gate_evidence = [gate_id for gate_id in required_gates if gate_id not in covered_gates]
+    citation_ids = [str(item.get('doc_id') or item.get('chunk_id') or item.get('label') or '') for item in citations if item]
+    diagnostics = dict(state.get('trace') or {})
+    diagnostics.update({
+        'evidence_grade': grade.model_dump(),
+        'citation_coverage_ok': len(citations) == len(selected),
+    })
+    return EvidenceArtifact(
+        profile=diagnostics.get('retrieval_profile'),
+        queries=[str(spec.get('query') or '') for spec in query_specs if spec.get('query')],
+        documents=[chunk.model_dump() for chunk in selected],
+        citations=citations,
+        selected_source_ids=list(dict.fromkeys([item for item in citation_ids if item])),
+        warnings=list(state.get('warnings') or []),
+        retrieval_diagnostics=diagnostics,
+        required_safety_gates=required_gates,
+        evidence_covers_required_gates=not missing_gate_evidence,
+        missing_gate_evidence=missing_gate_evidence,
+        generic_document_downgraded=False,
+    )
+
+
+def _matches_gate_context(chunk: RagChunk, gate) -> bool:
+    if chunk.safety_gate == getattr(gate, 'gate_id', None):
+        return True
+    metadata = ' '.join([
+        chunk.safety_gate or '',
+        chunk.doc_type or '',
+        chunk.document_title or '',
+        chunk.title or '',
+    ]).lower().replace('_', ' ')
+    terms: set[str] = set()
+    terms.update(_tokens(getattr(gate, 'gate_id', '')))
+    terms.update(_tokens(getattr(gate, 'name_ko', '')))
+    terms.update(_tokens(getattr(gate, 'description_ko', '')))
+    for term in getattr(gate, 'document_search_terms', None) or []:
+        terms.update(_tokens(term))
+    return bool(terms and any(term in metadata for term in terms))
 
 
 def _tokens(text: str) -> set[str]:

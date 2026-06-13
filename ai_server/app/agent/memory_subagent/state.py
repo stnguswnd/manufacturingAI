@@ -5,16 +5,20 @@ from typing import Any
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
-from app.schemas.agent import AgentRequest, AgentResponse
+from app.agent.artifacts import AnswerDraft, ContextArtifact, EvidenceArtifact, PlanningArtifact, PredictionArtifact, RequestArtifact, ResponseArtifact, RuntimeArtifact, SafetyArtifact
 
 
 class MemoryState(TypedDict, total=False):
+    run_id: str
     request: dict[str, Any]
+    context: dict[str, Any]
+    planning: dict[str, Any]
+    prediction: dict[str, Any] | None
+    evidence: dict[str, Any] | None
+    safety: dict[str, Any] | None
+    draft: dict[str, Any] | None
     response: dict[str, Any]
-    answer_memory_context: dict[str, Any]
-    recent_turns: list[dict[str, Any]]
-    recent_turn_routes: list[dict[str, Any]]
-    turn_process_data: dict[str, Any] | None
+    runtime: dict[str, Any]
     user_id: str
     answer_memory: dict[str, Any]
     session_last_process_data: dict[str, Any] | None
@@ -25,12 +29,16 @@ class MemoryState(TypedDict, total=False):
 
 
 class MemoryInput(BaseModel):
-    request: AgentRequest
-    response: AgentResponse
-    answer_memory_context: dict[str, Any] = Field(default_factory=dict)
-    recent_turns: list[dict[str, Any]] = Field(default_factory=list)
-    recent_turn_routes: list[dict[str, Any]] = Field(default_factory=list)
-    turn_process_data: dict[str, Any] | None = None
+    run_id: str
+    request: RequestArtifact
+    context: ContextArtifact = Field(default_factory=ContextArtifact)
+    planning: PlanningArtifact | None = None
+    prediction: PredictionArtifact | None = None
+    evidence: EvidenceArtifact | None = None
+    safety: SafetyArtifact | None = None
+    draft: AnswerDraft | None = None
+    response: ResponseArtifact
+    runtime: RuntimeArtifact = Field(default_factory=RuntimeArtifact)
     user_id: str
 
 
@@ -46,12 +54,16 @@ class MemoryOutput(BaseModel):
 
 def to_state(input_data: MemoryInput) -> MemoryState:
     return {
-        'request': input_data.request.model_dump(),
-        'response': input_data.response.model_dump(),
-        'answer_memory_context': dict(input_data.answer_memory_context),
-        'recent_turns': list(input_data.recent_turns),
-        'recent_turn_routes': list(input_data.recent_turn_routes),
-        'turn_process_data': input_data.turn_process_data,
+        'run_id': input_data.run_id,
+        'request': input_data.request.model_dump(mode='json'),
+        'context': input_data.context.model_dump(mode='json'),
+        'planning': input_data.planning.model_dump(mode='json') if input_data.planning else None,
+        'prediction': input_data.prediction.model_dump(mode='json') if input_data.prediction else None,
+        'evidence': input_data.evidence.model_dump(mode='json') if input_data.evidence else None,
+        'safety': input_data.safety.model_dump(mode='json') if input_data.safety else None,
+        'draft': input_data.draft.model_dump(mode='json') if input_data.draft else None,
+        'response': input_data.response.model_dump(mode='json'),
+        'runtime': input_data.runtime.model_dump(mode='json'),
         'user_id': input_data.user_id,
         'warnings': [],
         'diagnostics': {},

@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from app.agent.checkpointing import build_thread_id, reset_sqlite_checkpoint
 from app.agent.root_graph import RootManufacturingGraph
+from app.agent.artifacts import ContextArtifact, PlanningArtifact, RequestArtifact, ResponseArtifact, RuntimeArtifact, SafetyArtifact
 from app.agent.context import AnswerMemory, ContextCompressor, ContextPackBuilder, ContextResolver, ContextValidator, RecommendedAction
 from app.agent.context_subagent import ContextInput
 from app.agent.heavy import CitationBuilder, DiagnosticPlan, DiagnosticPlanToAgentPlanTranslator, DiagnosticPlanner, EvidenceGrader, PlanningResult, RagQueryPlanner
@@ -18,7 +19,7 @@ from app.agent.planning_subagent import PlanningInput
 from app.agent.planning_subagent import nodes as planning_nodes
 from app.agent.safety import SafetyContext, SafetyFormatter
 from app.agent.safety_subagent import SafetyInput
-from app.schemas.agent import AgentRequest, AgentResponse, AgentSendRequest
+from app.schemas.agent import AgentRequest, AgentSendRequest
 from app.schemas.prediction import FailureModeScore, PredictionResponse
 from app.schemas.rag import RagChunk
 from app.services.context_service import ContextService
@@ -111,7 +112,7 @@ def make_root(tmp_path, *, prediction_service=None, llm_service=None, rag_servic
         safety_validator=SafetyValidationService(),
         llm_service=llm,
         rag_service=rag,
-        checkpoint_path=tmp_path / 'checkpoints' / 'v2.sqlite3',
+        checkpoint_path=tmp_path / 'checkpoints' / 'v3.sqlite3',
     ), users
 
 
@@ -460,11 +461,32 @@ def test_checkpoint_state_contains_only_json_like_values(tmp_path):
     root.run(AgentSendRequest(user_id=user['user_id'], session_id='s_json', message='토크란?'))
     values = root._checkpoint_values(user_id=user['user_id'], session_id='s_json')
 
-    assert values['state_schema_version'] == 2
+    assert values['state_schema_version'] == 3
     assert_json_like(values)
     assert isinstance(values['request'], dict)
+    assert set(values).issubset({
+        'state_schema_version',
+        'run_id',
+        'user_id',
+        'session_id',
+        'thread_id',
+        'request',
+        'context',
+        'planning',
+        'prediction',
+        'evidence',
+        'safety',
+        'draft',
+        'validation',
+        'response',
+        'memory',
+        'audit',
+        'runtime',
+    })
+    for legacy_key in ['plan', 'retrieved_documents', 'citations', 'answer', 'safety_guidance', 'structured_answer_payload', 'manufacturing_context']:
+        assert legacy_key not in values
     assert isinstance(values['response'], dict)
-    assert values['last_answer_memory']['focus'] == '토크'
+    assert values['memory']['last_answer_memory']['focus'] == '토크'
     root.close()
 
 
@@ -478,7 +500,7 @@ def test_user_session_checkpoint_memory_isolation(tmp_path):
     values_b = root._checkpoint_values(user_id=user_b['user_id'], session_id='same_session')
 
     assert preview['selected_path'] == 'unsupported_or_clarification'
-    assert values_b.get('last_answer_memory') in (None, {})
+    assert (values_b.get('memory') or {}).get('last_answer_memory') in (None, {})
     root.close()
 
 
@@ -498,18 +520,32 @@ def test_root_subagents_emit_typed_outputs(tmp_path):
         request=ctx.request,
         manufacturing_context=DomainKnowledgeService().build_context(ctx.request, None, doc_count=0),
     ))
-    response = AgentResponse(
-        run_id='run_sub',
-        user_id=user['user_id'],
-        session_id='s_sub',
-        route=plan.route,
-        answer='LOTO 확인과 담당자 점검이 필요합니다.',
-        manufacturing_context=safety.manufacturing_context,
-    )
     memory = root.memory_subagent.invoke(MemoryInput(
-        request=ctx.request,
-        response=response,
-        answer_memory_context={'selected_path': 'supervisor_planning', 'structured_answer_payload': safety.structured_answer_payload},
+        run_id='run_sub',
+        request=RequestArtifact(
+            user_id=user['user_id'],
+            session_id='s_sub',
+            question=ctx.request.question,
+            original_message=ctx.request.question,
+            process_data=ctx.request.process_data.model_dump() if ctx.request.process_data else None,
+            top_k=ctx.request.top_k,
+            mode=ctx.request.mode,
+        ),
+        context=ContextArtifact(context_resolution=ctx.context_resolution, user_context=ctx.user_context),
+        planning=PlanningArtifact(
+            selected_path='supervisor_planning',
+            answer_type=plan.plan.intent,
+            intent=plan.plan.intent,
+            agent_plan=plan.plan.model_dump(mode='json'),
+            route=plan.route,
+        ),
+        safety=SafetyArtifact.model_validate(safety.safety_artifact),
+        response=ResponseArtifact(
+            answer='LOTO 확인과 담당자 점검이 필요합니다.',
+            route=plan.route,
+            public_citations=[],
+        ),
+        runtime=RuntimeArtifact(),
         user_id=user['user_id'],
     ))
 
@@ -589,7 +625,7 @@ def test_ai4i_prediction_intent_with_missing_features_routes_to_clarification(tm
     assert 'Air temperature' in response.missing_features
     assert 'Tool wear' in response.missing_features
     assert response.parsed_ai4i_features == {'Type': 'M', 'Torque': 34.0}
-    assert 'intent_gateway.ai4i_clarification' in response.route
+    assert 'response.clarification' in response.route
     assert '고장 확률' not in response.answer
     assert 'TWF 확률' not in response.answer
     root.close()
@@ -614,7 +650,7 @@ def test_ai4i_unclear_temperature_unit_routes_to_clarification(tmp_path):
     assert response.prediction_skip_reason == 'ambiguous_ai4i_features'
     assert response.prediction is None
     assert set(response.ambiguous_features) == {'Air temperature', 'Process temperature'}
-    assert 'intent_gateway.ai4i_clarification' in response.route
+    assert 'response.clarification' in response.route
     root.close()
 
 
@@ -644,7 +680,7 @@ def test_supervisor_keyword_policy_is_hidden_behind_diagnostic_planner():
     planner = DiagnosticPlanner(SupervisorService(NoopLLMService()))
     request = AgentRequest(user_id='u1', session_id='s1', question='정비 전에 안전 절차와 LOTO 확인해야 해?')
     diagnostic = planner.structured_plan(request)
-    root_source = inspect.getsource(RootManufacturingGraph._supervisor_planning_node)
+    root_source = inspect.getsource(RootManufacturingGraph._planning_router_node) + inspect.getsource(RootManufacturingGraph._initial_planning)
     planning_source = inspect.getsource(planning_nodes.run_diagnostic_planner)
 
     assert diagnostic.requires_safety is True

@@ -20,8 +20,8 @@ def reset_sqlite_checkpoint(path: Path) -> bool:
 
 
 def main() -> None:
-    default_path = LANGGRAPH_CHECKPOINT_DB.with_name(f'{LANGGRAPH_CHECKPOINT_DB.stem}_v2{LANGGRAPH_CHECKPOINT_DB.suffix}')
-    parser = argparse.ArgumentParser(description='Reset only the v2 LangGraph SQLite checkpoint file.')
+    default_path = LANGGRAPH_CHECKPOINT_DB.with_name(f'{LANGGRAPH_CHECKPOINT_DB.stem}_v3{LANGGRAPH_CHECKPOINT_DB.suffix}')
+    parser = argparse.ArgumentParser(description='Reset only the v3 LangGraph SQLite checkpoint file.')
     parser.add_argument('--path', type=Path, default=default_path)
     args = parser.parse_args()
     deleted = reset_sqlite_checkpoint(args.path)

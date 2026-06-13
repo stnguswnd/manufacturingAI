@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.agent.artifacts import ContextArtifact, PlanningArtifact, RequestArtifact, RuntimeArtifact
 from app.agent.rag_evidence import RagEvidenceDeps, RagEvidenceInput, RagEvidenceSubAgent
 from app.agent.root_graph import RootManufacturingGraph
 from app.agent.heavy import CitationBuilder, EvidenceFilter, EvidenceGrader, RagQueryPlanner
@@ -116,9 +117,22 @@ def test_rag_evidence_subagent_runs_langgraph_flow():
 
     assert output.retrieved_documents
     assert output.evidence_grade.usable is True
+    assert output.evidence_artifact.profile in {'prediction_plus_rag', 'rag_only_safety', 'troubleshooting_rag', 'concept_explanation'}
+    assert output.evidence_artifact.queries
+    assert output.evidence_artifact.citations
+    assert 'evidence_grade' in output.evidence_artifact.retrieval_diagnostics
     assert output.trace['query_spec_names'][0] == 'primary'
     assert output.trace['raw_count'] >= output.trace['filtered_count'] >= output.trace['selected_count']
     assert output.trace['citation_count'] == len(output.citations)
+
+
+def test_rag_evidence_artifact_persists_final_health_diagnostics():
+    output = agent(FakeRagService([[chunk('c1')]] * 4, chroma_count=701)).invoke(evidence_input())
+
+    assert output.trace['corpus_count_mismatch'] is True
+    assert output.evidence_artifact.generic_document_downgraded is False
+    assert output.evidence_artifact.retrieval_diagnostics['corpus_count_mismatch'] is True
+    assert any('Chroma collection count mismatch' in item for item in output.evidence_artifact.warnings)
 
 
 def test_root_graph_passes_subagent_output_to_state(tmp_path: Path):
@@ -126,30 +140,38 @@ def test_root_graph_passes_subagent_output_to_state(tmp_path: Path):
     send = request()
     req = agent_request(send)
     plan = AgentPlan(intent='hybrid', rag_required=True, rag_query='maintenance', required_nodes=['Procedure Retrieval Agent'])
-    context = root.domain_service.build_context(req, None, doc_count=0)
     state = {
-        'state_schema_version': 2,
+        'state_schema_version': 3,
         'run_id': 'r1',
         'user_id': 'u1',
         'session_id': 's1',
         'thread_id': 'u1:s1',
-        'current_user_message': send.message,
-        'send_request': send.model_dump(),
-        'request': req.model_dump(),
-        'plan': plan.model_dump(),
-        'manufacturing_context': context.model_dump(),
-        'warnings': [],
-        'errors': [],
-        'usage_records': [],
-        'trace': [],
-        'replan_count': 0,
+        'request': RequestArtifact(
+            user_id='u1',
+            session_id='s1',
+            question=send.message,
+            original_message=send.message,
+            top_k=4,
+        ).model_dump(mode='json'),
+        'context': ContextArtifact().model_dump(mode='json'),
+        'planning': PlanningArtifact(
+            selected_path='supervisor_planning',
+            answer_type='diagnosis',
+            intent='hybrid',
+            needs_rag=True,
+            agent_plan=plan.model_dump(mode='json'),
+            route=plan.required_nodes,
+        ).model_dump(mode='json'),
+        'runtime': RuntimeArtifact().model_dump(mode='json'),
     }
 
-    out = root._evidence_retrieval_node(state)
+    out = root._rag_evidence_node(state)
 
-    assert out['retrieved_documents'][0]['chunk_id'] == 'c1'
-    assert out['citations']
-    assert out['rag_evidence']['trace']['selected_count'] == len(out['retrieved_documents'])
+    assert out['evidence']['documents'][0]['chunk_id'] == 'c1'
+    assert out['evidence']['citations']
+    assert out['evidence']['profile'] is not None
+    assert 'evidence_grade' in out['evidence']['retrieval_diagnostics']
+    assert out['evidence']['retrieval_diagnostics']['selected_count'] == len(out['evidence']['documents'])
 
 
 def test_empty_or_failed_retrieval_degrades_without_crash():

@@ -6,21 +6,22 @@
 
 ## 1. 프로젝트 한 줄 소개
 
-AI4I 제조 공정 예측, OSHA/Haas/KOSHA 문서 기반 RAG, YAML 안전 게이트, LangGraph SubAgent orchestration, token/cost 관측을 결합한 제조 특화 AI Agent 서버입니다.
+AI4I 제조 공정 예측, OSHA/Haas/KOSHA 문서 기반 RAG, YAML 안전 게이트, artifact contract 기반 LangGraph bounded agentic workflow, token/cost 관측을 결합한 제조 특화 AI Agent 서버입니다.
 
 ## 2. 현재 제품 구조
 
 ```text
 POST /agent/send
   -> RootManufacturingGraph(StateGraph)
-      -> ContextSubAgent
-      -> PlanningSubAgent
-      -> manufacturing_analysis
-      -> RagEvidenceSubAgent
-      -> SafetySubAgent
-      -> response_synthesis
+      -> request_context
+      -> planning_router
+      -> prediction_node -> prediction_quality_gate
+      -> rag_evidence_subagent -> evidence_quality_gate
+      -> safety_contract_subagent -> safety_contract_gate
+      -> answer_compose
+      -> answer_text_review
       -> response_packager
-      -> MemorySubAgent
+      -> memory_writer
       -> audit_persistence
 ```
 
@@ -31,12 +32,12 @@ POST /agent/send
 | 영역 | 현재 구현 | 강조 포인트 |
 | --- | --- | --- |
 | FastAPI 제품 API | `/agent/send`, `/agent/send/stream`, `/rag/search` | 실제 서버 API와 Streamlit 데모 UI가 분리됨 |
-| LangGraph orchestration | Root graph + 5개 SubAgent | 큰 graph를 책임별 StateGraph로 분리 |
+| LangGraph orchestration | Root graph + artifact-only v3 state + bounded subagents | graph edge에서 prediction/RAG/safety/review/retry 흐름이 보임 |
 | AI4I prediction | 6개 필수 feature가 완전할 때만 예측 | 불완전하면 clarification으로 종료하고 RAG를 실행하지 않음 |
 | RAG Evidence | Chroma `manufacturing_rag`, 727 vectors | AI4I CSV가 아니라 OSHA/Haas/KOSHA 문서만 corpus로 사용 |
 | Adaptive RAG | prediction_plus_rag, rag_only_safety, troubleshooting_rag, concept_explanation | 질문 유형별 retrieval profile과 evidence selection 분리 |
 | Safety gate | `safety_gate_matrix.yaml` + `SafetySubAgent` | LOTO, 회전부 방호, 정비 자격 등 deterministic policy 적용 |
-| 안전 검증 | Safety validator + replan/차단 | 필수 안전 내용 누락 또는 금지 표현을 최종 응답 전에 차단 |
+| 안전 검증 | Artifact Quality Gate + Answer Text Review + Safety validator | artifact 품질과 최종 문장 정책을 분리해 검증 |
 | Context/Memory | ContextSubAgent, MemorySubAgent, checkpoint/history | user/session별 follow-up context 유지 |
 | Observability | llm usage, trace, run history | token, cost, route, citation, warnings를 내부 기록으로 보존 |
 | Streamlit UI | Agent 실행, 진행 trace, RAG 확인 | 데모와 디버깅에 필요한 화면 제공 |
@@ -68,7 +69,7 @@ OSHA / Haas / KOSHA documents
 ## 5. 현재 검증 상태
 
 ```text
-Full test snapshot: 93 passed
+Full test snapshot: 124 passed
 RAG corpus: rag_chunks.jsonl 727
 Chroma collection: manufacturing_rag 727 vectors
 RAG evaluation notebook: executed end-to-end, 15 code cells, 0 cell errors

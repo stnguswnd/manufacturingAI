@@ -1,30 +1,38 @@
-# RAG Evidence SubAgent
+# Adaptive RAG Evidence SubAgent
 
-RAG Evidence is a LangGraph `StateGraph` subagent. It is separate from the
-AI4I prediction tool: AI4I process data drives risk prediction, while OSHA,
-Haas, and KOSHA documents provide maintenance, safety, and troubleshooting
-evidence.
+`rag_evidence_subagent` is the Adaptive RAG execution unit in the bounded
+workflow. It is separate from the AI4I prediction tool: AI4I process data drives
+risk prediction, while OSHA, Haas, and KOSHA documents provide maintenance,
+safety, and troubleshooting evidence.
 
 ## Runtime Shape
 
 ```text
 RootManufacturingGraph
-  -> manufacturing analysis
+  -> planning_router
   -> RagEvidenceSubAgent.invoke(...)
+       -> profile selection
        -> plan_queries
        -> retrieve
        -> filter
        -> grade
        -> cite
-       -> build_payload
+       -> build_payload / EvidenceArtifact
        -> trace
-  -> safety / formatting
+  -> planning_router
+  -> evidence_quality_gate
+  -> planning_router
+  -> safety_contract_subagent / answer_compose
 ```
 
-The root graph does not call RAG internals directly. It converts root
-`AgentState` into `RagEvidenceInput`, invokes the compiled subagent graph, and
-copies the resulting documents, citations, grade, context, warnings, and trace
-back into canonical root state fields.
+The root graph does not call RAG internals directly. It converts
+`RequestArtifact`, `PlanningArtifact`, `PredictionArtifact`, and
+`ContextArtifact` into `RagEvidenceInput`, invokes the compiled subagent graph,
+and stores only `state["evidence"] = EvidenceArtifact`.
+
+`EvidenceArtifact` is first consumed by `evidence_quality_gate`. After it passes,
+SafetyContractSubAgent and AnswerComposer can consume it. It is not a public
+answer text surface.
 
 ## State
 
@@ -35,17 +43,28 @@ trace, and output.
 
 No request-specific state is stored on services.
 
-## Query Fan-Out
+## Adaptive Profile And Query Fan-Out
 
-Fan-out is deterministic and bounded to four query specs:
+Fan-out is deterministic and bounded to four query specs. The active profile is
+stored as `trace["retrieval_profile"]` and `EvidenceArtifact.profile`.
+
+Profiles:
+
+- `prediction_plus_rag`
+- `rag_only_safety`
+- `troubleshooting_rag`
+- `concept_explanation`
+
+Possible query spec names:
 
 - `primary`
-- `maintenance_check`
+- `safety_{gate_id}`
 - `troubleshooting`
-- `safety_loto_guarding`
+- `failure_mode`
 
-Torque, tool wear, OSF/TWF, spindle, maintenance, and safety cues add the extra
-specs. The policy does not call an LLM.
+Safety gates can add gate-specific metadata terms and title supplements. OSF/TWF
+or troubleshooting profiles can add troubleshooting and failure-mode specs. The
+policy does not call an LLM.
 
 ## Selection And Trace
 
@@ -56,6 +75,25 @@ The trace is compact and log-safe. It includes query spec names, backend,
 counts, selected sources, selected safety gates, warnings, and corpus count
 mismatch status. It does not include raw chunk text, API keys, full prompts, or
 large local paths.
+
+Evidence diagnostics include deterministic critic fields:
+
+- `citation_coverage_ok`
+- `selected_chunk_ids_unique`
+- `selected_doc_ids_unique`
+- `evidence_grade_selected_consistent`
+- `required_safety_gates`
+- `evidence_covers_required_gates`
+- `missing_gate_evidence`
+- `generic_document_downgraded`
+
+For safety questions, missing required gate evidence is reported in
+`EvidenceArtifact` so `evidence_quality_gate` can choose `rerun_rag` before
+answer composition. It does not silently mark unrelated evidence as usable.
+
+SafetyContractSubAgent does not call Chroma, retrievers, or citation builders.
+It consumes `EvidenceArtifact` and turns selected evidence plus safety gate YAML
+into `SafetyArtifact`.
 
 Chroma failures do not fall back to JSONL search in the RAG Evidence path.
 Failures produce empty evidence plus explicit warnings.

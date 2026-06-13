@@ -18,15 +18,6 @@ class SupervisorService:
     def __init__(self, llm_service: LLMService | None = None):
         self.llm_service = llm_service or LLMService()
 
-    def plan(self, req: AgentRequest, usage_callback: Callable[[LLMUsageRecord], None] | None = None) -> AgentPlan:
-        base = self._deterministic_plan(req)
-        if self._resolved_turn(req):
-            return base
-        if not AGENT_SUPERVISOR_LLM_REFINEMENT:
-            return base
-        refined = self._llm_refine(req, base, usage_callback=usage_callback)
-        return refined or base
-
     def replan(self, req: AgentRequest, previous: AgentPlan, audit_findings: list[str], attempt: int) -> AgentPlan:
         """Create a bounded correction plan after an audit/validator failure.
 

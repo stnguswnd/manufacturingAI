@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
+from app.agent.artifacts import EvidenceArtifact
 from app.agent.heavy.rag_schemas import EvidenceGrade
 from app.schemas.agent import AgentPlan, AgentRequest
 from app.schemas.domain import ManufacturingContext
@@ -24,6 +25,7 @@ class RagEvidenceState(TypedDict, total=False):
     selected_chunks: list[dict[str, Any]]
     evidence_grade: dict[str, Any]
     citations: list[dict[str, Any]]
+    evidence_artifact: dict[str, Any]
     warnings: list[str]
     trace: dict[str, Any]
     output: dict[str, Any]
@@ -44,6 +46,7 @@ class RagEvidenceOutput(BaseModel):
     retrieved_documents: list[RagChunk] = Field(default_factory=list)
     citations: list[dict[str, Any]] = Field(default_factory=list)
     evidence_grade: EvidenceGrade
+    evidence_artifact: EvidenceArtifact = Field(default_factory=EvidenceArtifact)
     manufacturing_context: ManufacturingContext
     warnings: list[str] = Field(default_factory=list)
     trace: dict[str, Any] = Field(default_factory=dict)
@@ -71,6 +74,7 @@ def to_output(state: RagEvidenceState) -> RagEvidenceOutput:
         retrieved_documents=[RagChunk.model_validate(item) for item in output.get('retrieved_documents') or []],
         citations=list(output.get('citations') or []),
         evidence_grade=EvidenceGrade.model_validate(output.get('evidence_grade') or state.get('evidence_grade') or {'usable': False, 'weak_reason': 'no_grade'}),
+        evidence_artifact=EvidenceArtifact.model_validate(output.get('evidence_artifact') or state.get('evidence_artifact') or {}),
         manufacturing_context=ManufacturingContext.model_validate(output.get('manufacturing_context') or state['manufacturing_context']),
         warnings=list(output.get('warnings') or state.get('warnings') or []),
         trace=dict(output.get('trace') or state.get('trace') or {}),

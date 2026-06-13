@@ -46,7 +46,7 @@
 - API/UI entry: `/agent/send`
 - Data dependency: user question, diagnostic plan, safety gate metadata, prediction context
 - Safety impact: safety 질문에서 safety gate/title metadata supplement 적용
-- Observability: `adaptive_rag_profile`, query spec names, selected safety gates
+- Observability: `retrieval_profile`, query spec names, selected safety gates
 - Tests: planned query sanitize, RAG-only safety, prediction_plus_rag
 - Demo steps: 드릴기 안전 질문과 AI4I prediction 질문 비교
 

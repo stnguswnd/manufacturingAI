@@ -20,13 +20,10 @@
 - 예측 모델 보완
   - 학습 시 train/test split 기반 성능 지표를 `ai_server/storage/models/ai4i_metrics.json`에 저장한다.
   - 입력값이 학습 데이터 분포 외곽이면 `input_warnings`로 경고한다.
-- 안전 검증 추가
-  - 최종 답변이 안전 게이트 내용을 누락하거나 설비 제어/보증 표현을 포함하면 차단한다.
-  - LLM 답변이 검증에 실패하면 Supervisor 재계획 후 재시도하고, 끝까지 실패하면 응답을 차단한다.
-- Supervisor feedback loop 추가
-  - RAG 근거가 없거나 사용자 원문과 직접 연결되는 문서 근거가 약하면 Supervisor가 재계획한다.
-  - LLM 답변의 안전 검증 실패 또는 구조화 출력 파싱 실패 사유를 Supervisor에 돌려보내 재계획 후 재시도한다.
-  - `AGENT_MAX_REPLAN_ATTEMPTS`로 재계획 횟수를 제한한다.
+- Artifact Quality Gate / Answer Text Review 추가
+  - Prediction, Evidence, SafetyArtifact는 생성 직후 quality gate를 통과해야 한다.
+  - 최종 답변 문장은 Answer Text Review에서 debug leak, safety 누락, 금지 표현을 검증한다.
+  - rewrite/RAG rerun/safety rerun은 `RuntimeArtifact`의 per-action retry budget으로 제한한다.
 - LLM 토큰/비용 측정 추가
   - OpenAI 응답의 `usage`에서 input/output/cached token을 읽어 `llm_usage`에 기록한다.
   - 내부 모델 가격표 기준으로 요청별 예상 비용을 계산한다.

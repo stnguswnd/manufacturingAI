@@ -1,296 +1,324 @@
 # Manufacturing AI Agent Architecture
 
+이 프로젝트는 자율형 멀티 에이전트가 아니다.
+제조 안전 도메인에 맞춰 Prediction, Adaptive RAG Evidence, Safety Contract,
+Answer Text Review를 Artifact contract와 LangGraph conditional edge로 제어하는
+bounded agentic workflow다.
+
 ## Runtime Flow
 
 ```text
-User Request
-  -> RootManufacturingGraph
-  -> Checkpoint v2 thread lookup (thread_id = user_id:session_id)
-  -> ContextSubAgent
-  -> IntentGateway / structured classifier
-  -> selected path
-  -> answer node or PlanningSubAgent + manufacturing path
-  -> RagEvidenceSubAgent when document evidence is required
-  -> SafetySubAgent when safety gates are required
-  -> FormatterRegistry
-  -> MemorySubAgent
-  -> checkpoint v2 save
+START
+  -> request_context
+  -> planning_router
+  -> conditional:
+       prediction_node -> prediction_quality_gate -> planning_router
+       rag_evidence_subagent -> evidence_quality_gate -> planning_router
+       safety_contract_subagent -> safety_contract_gate -> planning_router
+       fast_answer -> output_policy_gate -> response_packager
+       clarification_response -> response_packager
+       answer_compose
+  -> answer_text_review
+  -> conditional:
+       pass -> response_packager
+       rewrite_only -> invalidate_rewrite -> answer_rewrite -> answer_text_review
+       rerun_rag -> invalidate_rag_downstream -> rag_evidence_subagent -> planning_router
+       rerun_safety -> invalidate_safety_downstream -> safety_contract_subagent -> planning_router
+       clarification_required -> clarification_response -> response_packager
+       block -> safe_block_response -> response_packager
+       max_retry_exceeded -> safe_review_fallback -> response_packager
+  -> memory_writer
+  -> audit_persistence
+  -> END
 ```
 
-`root_graph.py` is the top-level orchestration boundary. Context resolution,
-context packing, planning, RAG evidence, safety policy, and memory update are
-handled by dedicated LangGraph SubAgents with their own request-scoped state.
+## Two Bounded Loops
 
-## ContextResolution
+앞쪽 루프는 Artifact 준비 + Artifact 품질 검증 루프다.
 
-`ContextResolver` receives only:
-
-- `current_user_message`
-- `last_answer_memory`
-- `recent_turns`
-- `rolling_summary`
-
-It does not receive raw RAG documents, full conversation history, formatter
-context, or legacy focus fields. It returns a structured `ContextResolution`
-with:
-
-- `is_followup`
-- `followup_type`
-- `followup_target`
-- `followup_item_index`
-- `standalone_query`
-- `context_needed`
-- `confidence`
-- `reason`
-
-Examples:
-
-- `왜?` with answer memory -> `previous_answer_reason`
-- `방금 권장조치 순서대로 알려줘` -> `previous_recommended_actions`
-- `그중 2번은 왜 필요한데?` -> `previous_recommended_action_item`
-- `LOTO가 뭐야?` -> standalone concept question, even if the previous answer was heavy analysis
-
-## ContextPackBuilder
-
-`ContextPackBuilder` creates node-specific context contracts:
-
-- `classifier_context`
-- `answer_context`
-- `rag_context`
-- `safety_context`
-- `formatter_context`
-- `memory_writer_context`
-
-The classifier context is intentionally small. It can include the current
-message, standalone query, follow-up metadata, last answer summary/focus, recent
-turn intents, and glossary summary. It must not include retrieved document
-text, raw messages, full conversation history, safety manuals, raw exceptions,
-or the full root state.
-
-`recommended_actions` is only included in `formatter_context` when
-`answer_type == recommended_action_recap`. A single action item is only included
-when `answer_type == recommended_action_item_explanation`.
-
-## FormatterRegistry
-
-`FormatterRegistry` renders already-decided routes. Formatters do not infer
-intent from the user question.
-
-Current formatter keys:
-
-- `fast_concept_answer`
-- `general_lightweight_answer`
-- `recommended_action_recap`
-- `recommended_action_item_explanation`
-- `safety_answer`
-- `clarification`
-- explicit degrade path
-
-This prevents the old problem where a lightweight answer could accidentally
-inherit the heavy analysis format (`판정`, `위험도`, `권장 조치`, etc.).
-
-## SafetyPolicy
-
-Safety routing is not decided by the formatter. Once a route requires safety,
-`SafetyPolicy` builds a `SafetyContext` containing:
-
-- `must_include`
-- `forbidden`
-- `disclaimer_level`
-- `requires_professional_review`
-- `allowed_scope`
-
-`SafetyFormatter` renders this safety context. Fast concept answers should not
-receive a full safety checklist unless the route explicitly requires it.
-
-## AnswerMemory
-
-Legacy state fields are removed:
-
-- `last_focus`
-- `last_answer_claims`
-- `last_answer_key_phrases`
-- top-level `recommended_actions`
-
-The single answer-memory object is:
-
-- `selected_path`
-- `answer_type`
-- `user_intent`
-- `short_summary`
-- `focus`
-- `key_points`
-- `claims`
-- `recommended_actions`
-- `decisions`
-- `code_changes`
-- `tables`
-- `mentioned_entities`
-- `unresolved_questions`
-- `source_refs`
-- `safety_level`
-- `created_at`
-- `expires_after_turns`
-
-`AnswerMemory.recommended_actions` is always a list of structured
-`RecommendedAction` objects:
-
-- `id`
-- `title`
-- `rationale`
-- `safety_note`
-- `priority`
-
-String actions from existing tools or LLM output are normalized before being
-stored internally.
-
-## Checkpoint v2 Policy
-
-Checkpoint state is v2-only:
-
-- `state_schema_version = 2`
-- `thread_id = user_id:session_id`
-- v1 checkpoints are not migrated
-- v1 checkpoints are ignored by `_checkpoint_values`
-- default SQLite file uses a v2 name: `langgraph_checkpoints_v2.sqlite3`
-
-Checkpointed state is sanitized to primitives only:
-
-- allowed: `dict`, `list`, `str`, `int`, `float`, `bool`, `None`
-- not allowed: Pydantic models, `AgentRequest`, `AgentResponse`, LangChain
-  messages, or arbitrary Python objects
-
-The reset helper removes only the v2 checkpoint file:
-
-```bash
-cd ai_server
-../.venv312/bin/python -m app.agent.checkpointing.reset
+```text
+request_context
+  -> planning_router
+  -> prediction_node -> prediction_quality_gate
+  -> rag_evidence_subagent -> evidence_quality_gate
+  -> safety_contract_subagent -> safety_contract_gate
+  -> planning_router
 ```
 
-## Hard Gate Audit
+`planning_router`가 artifact 준비 상태를 보고 다음 실행 node를 고른다.
+`rag_evidence_subagent`는 Adaptive RAG 실행 단위이며 profile selection,
+query planning, fan-out, retrieve, filter, grade, cite, `EvidenceArtifact`
+생성을 담당한다.
 
-Hard gates are retained only where they protect safety, tool scope, or obvious
-no-LLM paths. Semantic follow-up decisions are handled by `ContextResolver` and
-the intent classifier. Gate definitions live under `app/agent/routing/`.
+뒤쪽 루프는 최종 답변 문장 검증 루프다.
 
-| Location | Terms | Purpose | Misclassification Prevented | Final Decision or Candidate Signal | Tests |
-| --- | --- | --- | --- | --- | --- |
-| `ControlScopeGate` | stop/start/control terms | refuse direct machine control | treating unsafe control as normal Q&A | final safety/scope gate | gateway tests |
-| `MetaFeedbackGate` | bug/context/routing feedback | route product feedback away from manufacturing analysis | heavy report format on system feedback | final meta route | `test_meta_feedback_preserves_focus_policy` |
-| `ProcessDataDiagnosisGate` | risk/failure/current condition terms with process data | force real process-data questions to heavy analysis | lightweight answer for risk judgement | final hard gate only when `process_data` exists | `test_process_data_risk_question_is_hard_gated_to_supervisor` |
-| `SafetyRequestGate` | safety/maintenance terms | require safety-aware planning | unsafe lightweight maintenance advice | final safety hard gate | `test_safety_request_is_not_lightweight` |
-| `DocumentRequestGate` | document/source terms | route document-backed question to RAG | unsupported citation request | final lightweight RAG gate | gateway tests |
-| `GlossaryConceptGate` | simple concept terms + glossary hit | no-LLM glossary fast path | unnecessary LLM/heavy path for concepts | final no-LLM fast path, only with glossary hit | `test_no_llm_glossary_concept_uses_fast_path` |
-| `RecommendedActionFollowupGate` | `ContextResolution.followup_type` | route action recap/item follow-ups to dedicated formatters | action recap falling into `general_lightweight_answer` | final follow-up gate after ContextResolver | `test_recommended_action_followup_routes_to_recap_not_lightweight` |
-| `FollowupCandidateGate` | pronoun/reason/action signals | expose a candidate signal only | candidate signal accidentally selecting a path | candidate signal, never final | `test_followup_candidate_gate_does_not_make_final_route_decision` |
-| `followup_signals.py` markers | pronoun/reason/action signals | produce resolver input signals | treating short follow-up as standalone | candidate signal only | `ContextResolver` tests |
-| `DeterministicDiagnosticPolicy` | manufacturing planning hints | deterministic heavy-route policy | missing RAG/safety/prediction stages in heavy path | structured `DiagnosticPlan`, then converted to `AgentPlan` | `test_supervisor_keyword_policy_is_hidden_behind_diagnostic_planner`, `test_diagnostic_planner_returns_structured_plan` |
+```text
+answer_compose
+  -> answer_text_review
+  -> answer_rewrite 또는 upstream rerun edge
+```
 
-Risk note: deterministic manufacturing planning still exists, but it is hidden
-behind `DiagnosticPlanner` and represented as a structured `DiagnosticPlan`
-before the rest of the graph sees it. Root graph callers should not inspect
-keyword matches directly.
+RAG 품질과 SafetyArtifact 품질은 앞쪽 quality gate에서 먼저 검증한다.
+`answer_text_review`는 public answer 문장이 근거, safety contract, output
+policy를 지켰는지 확인한다. 문장 문제는 `rewrite_only`로 뒤쪽 루프 안에서
+해결하고, 뒤늦게 발견된 근거/Safety 문제만 `rerun_rag` 또는 `rerun_safety`로
+앞쪽 루프에 되돌린다.
 
-## Heavy Manufacturing Path Audit
+`RootManufacturingGraph`는 `StateGraph(ManufacturingAgentState)`를 연결하는
+top-level orchestration boundary다. 하위 서비스와 subagent 생성은
+`AgentRuntimeDeps`에서 조립하고, RootGraph는 node/edge 연결과 artifact
+전달에 집중한다.
 
-The heavy path is separated by root nodes and SubAgents:
+## ManufacturingAgentState
 
-- `supervisor_planning`: invokes `PlanningSubAgent`
-- `manufacturing_analysis`: prediction and domain context
-- `evidence_retrieval`: invokes `RagEvidenceSubAgent`
-- `safety`: invokes `SafetySubAgent`
-- `response_synthesis`: LLM answer composition and safety validation
-- `response_packager`: public response object
-- `focus_updater`: invokes `MemorySubAgent`
+Runtime state는 v3 artifact-only 구조다. Root-level runtime field는 artifact key로 제한한다.
 
-Remaining coupling:
+```python
+class ManufacturingAgentState(TypedDict, total=False):
+    state_schema_version: int
+    run_id: str
+    user_id: str
+    session_id: str
+    thread_id: str
 
-- `SupervisorService` still owns LLM refinement and replan behavior, but
-  deterministic planning is isolated behind `DiagnosticPlanner`.
-- Manufacturing analysis and response synthesis remain root-level nodes.
+    request: RequestArtifact | None
+    context: ContextArtifact | None
+    planning: PlanningArtifact | None
+    prediction: PredictionArtifact | None
+    evidence: EvidenceArtifact | None
+    safety: SafetyArtifact | None
+    draft: AnswerDraft | None
+    validation: ValidationReport | None
+    response: ResponseArtifact | None
+    memory: MemoryArtifact | None
+    audit: AuditArtifact | None
+    runtime: RuntimeArtifact | None
+```
 
-Current heavy modules:
+삭제한 root-level runtime field:
 
-1. `DiagnosticPlanner`
-2. `RagQueryPlanner`
-3. `RagEvidenceSubAgent`
-4. `EvidenceFilter`
-5. `EvidenceGrader`
-6. `CitationBuilder`
-7. `SafetyGateBuilder`
-8. `RecommendationBuilder`
-9. `StructuredAnswerPayloadBuilder`
+- `plan`
+- `prediction` as raw `PredictionResponse`
+- `retrieved_documents`
+- `citations`
+- `safety_guidance`
+- `safety_warnings`
+- `structured_answer_payload`
+- `manufacturing_context`
+- `answer`
+- `report`
+- `usage_records`
+- `trace`
+- `replan_count`
 
-RAG role contracts:
+필요한 값은 각 artifact 내부에 둔다. 예를 들어 citation은
+`EvidenceArtifact.citations`, 답변 초안은 `AnswerDraft.text`, public answer는
+`ResponseArtifact.answer`, trace/usage/replan count는 `RuntimeArtifact`에 둔다.
 
-| Component | Responsibility | Explicit Non-Responsibility |
+## Artifact Contract
+
+- `RequestArtifact`: user/session/question/process data/top_k/model.
+- `ContextArtifact`: recent turns, rolling summary, context resolution,
+  context packs, AI4I feature status, process data reference policy.
+- `PlanningArtifact`: selected path, answer type, execution needs,
+  completed nodes, next node, full `AgentPlan` payload.
+- `PredictionArtifact`: prediction called/result/skip reason, parsed/missing
+  AI4I features.
+- `EvidenceArtifact`: Adaptive RAG retrieval profile, queries, selected documents,
+  citations, required safety gate evidence coverage.
+- `SafetyArtifact`: required gates, natural language constraints, forbidden
+  actions, required checks, public guidance.
+- `AnswerDraft`: generated or rewritten draft before validation.
+- `ValidationReport`: quality gate/text review failures and bounded `next_action`.
+- `ResponseArtifact`: sanitized public answer payload before mapping to
+  `AgentResponse`.
+- `RuntimeArtifact`: review iteration, per-action retry budget, evidence
+  signatures, quality gate reports, usage records, trace, runtime errors.
+
+## Node Read/Write Contract
+
+| Node | Reads | Writes |
 | --- | --- | --- |
-| `RagQueryPlanner` | build retrieval request/query | no retrieval execution |
-| `RagEvidenceSubAgent` | coordinate query planning, retrieval, filtering, grading, citation, and trace | no prediction or final answer composition |
-| `RagService` / `ChromaRetriever` | execute Chroma search | no query planning, grading, or JSONL fallback in production |
-| `EvidenceFilter` | dedupe and remove empty evidence | no relevance grading |
-| `EvidenceGrader` | decide usable/weak evidence | no citation building |
-| `CitationBuilder` | build citations from graded evidence | no retrieval or grading |
+| `request_context` | `request`, previous `context`/`memory` | `request`, `context` |
+| `planning_router` | `request`, `context`, `planning`, `prediction`, `evidence`, `safety`, `validation`, `runtime` | `planning` |
+| `prediction_node` | `request`, `context`, `planning` | `prediction` |
+| `prediction_quality_gate` | `planning`, `prediction`, `context` | `validation`, `runtime`, optional `planning` clarification |
+| `rag_evidence_subagent` | `request`, `planning`, `prediction`, `context` | `evidence` |
+| `evidence_quality_gate` | `planning`, `evidence`, `runtime` | `validation`, `runtime` |
+| `safety_contract_subagent` | `request`, `planning`, `prediction`, `evidence` | `safety` |
+| `safety_contract_gate` | `planning`, `evidence`, `safety`, `context`, `runtime` | `validation`, `runtime` |
+| `answer_compose` | `request`, `context`, `planning`, `prediction`, `evidence`, `safety` | `draft` |
+| `answer_text_review` | `draft`, `evidence`, `safety`, `planning`, `runtime` | `validation`, `runtime` |
+| `answer_rewrite` | artifacts plus previous failure summary in `runtime` | `draft` |
+| `response_packager` | artifacts | `response` |
+| `output_policy_gate` | `response` | `response`, `validation`, `runtime` |
+| `memory_writer` | `request`, `context`, `response` | `memory` |
+| `audit_persistence` | public `AgentResponse` projection | `audit` |
 
-Legacy graph removal audit:
+`RuntimeArtifact` is the cross-cutting operational artifact for trace, usage,
+review iteration, and errors.
 
-| Removed Method | Replacement |
-| --- | --- |
-| removed RAG query helper | `RagQueryPlanner.plan` |
-| removed evidence term helper | `EvidenceGrader.grade` |
-| removed action phrase helper | `RecommendationBuilder.collect_action_phrases` |
-| removed safety guidance helper | `SafetyGateBuilder.safety_guidance` |
-| removed warning helper | `SafetyGateBuilder.warnings` |
-| removed payload helper | `StructuredAnswerPayloadBuilder.build` |
+## Planning Router
 
-Recommended next work:
+`planning_router` is deterministic policy plus bounded planner output. It
+does not run an autonomous loop. It reads completed artifacts and chooses one
+`planning.next_node`.
 
-1. promote RAG query/retrieve/filter/grade/citation classes into LangGraph
-   subgraph nodes with local replan edges
-2. make `RecommendationBuilder` produce rich rationale/safety notes from domain
-   catalog metadata
-3. keep root graph dependencies explicit; do not reintroduce compatibility
-   wrappers
+Rules:
 
-## Architecture Contract Tests
+- AI4I prediction requires all six features:
+  `Type`, `Air temperature`, `Process temperature`, `Rotational speed`,
+  `Torque`, `Tool wear`.
+- If prediction intent exists but features are missing/ambiguous/invalid,
+  `planning.clarification_required=True` and the graph routes to
+  `clarification_response`.
+- Incomplete AI4I requests never fall through to RAG-only answers.
+- If prediction is complete, `prediction_node` runs first.
+- If document evidence is needed, `rag_evidence_subagent` runs.
+- If safety constraints are needed, `safety_contract_subagent` runs.
+- When required artifacts exist, the graph routes to `answer_compose`.
 
-| Contract | Test |
-| --- | --- |
-| classifier context excludes retrieved docs and raw messages | `test_context_pack_builder_excludes_raw_docs_and_messages_from_classifier_context` |
-| new concept question is not polluted by previous heavy memory | `test_previous_heavy_memory_does_not_pollute_new_concept_question`, `test_context_resolver_new_concept_not_polluted_by_heavy_memory` |
-| recommended action recap uses dedicated formatter | `test_integrated_recommended_action_recap_uses_dedicated_formatter`, `test_recommended_action_followup_routes_to_recap_not_lightweight` |
-| recommended action item uses action rationale/safety note | `test_integrated_recommended_action_item_uses_action_rationale`, `test_recommended_action_item_formatter_uses_item_rationale_and_safety_note` |
-| checkpoint state is primitive-only | `test_checkpoint_state_contains_only_json_like_values` |
-| thread id separates user/session memory | `test_user_session_checkpoint_memory_isolation`, `test_checkpoint_thread_id_policy_and_reset` |
-| general lightweight formatter does not infer recap from action presence | `test_formatter_does_not_infer_recap_from_actions_on_general_path` |
-| fast concept formatter does not leak heavy format | `test_fast_concept_formatter_does_not_leak_heavy_format` |
-| follow-up candidate gate is not final | `test_followup_candidate_gate_does_not_make_final_route_decision` |
-| supervisor keyword policy is hidden behind diagnostic planner | `test_supervisor_keyword_policy_is_hidden_behind_diagnostic_planner` |
-| diagnostic planner returns structured plan | `test_diagnostic_planner_returns_structured_plan` |
-| RAG query planner does not retrieve directly | `test_rag_query_planner_does_not_retrieve_directly` |
-| evidence grader does not build citations | `test_evidence_grader_does_not_build_citations` |
-| citation builder uses graded evidence | `test_citation_builder_uses_graded_evidence` |
-| legacy imperative graph module is removed | `test_manufacturing_graph_legacy_module_removed` |
+## Quality Gate And Text Review Edges
 
-## Current Guarantees
+Artifact quality gates run immediately after their producer nodes.
 
-- New concept questions are not polluted by prior heavy answers.
-- Follow-up action recap uses structured `AnswerMemory.recommended_actions`.
-- Action item explanations use the selected action's `rationale` and
-  `safety_note`.
-- Checkpoint snapshots are JSON-like and include `state_schema_version = 2`.
-- Different `user_id/session_id` pairs do not share `last_answer_memory`.
-- Deterministic heavy-path keyword planning is represented as `DiagnosticPlan`
-  behind `DiagnosticPlanner`.
-- RAG responsibilities are separated into query planning, retrieval, filtering,
-  grading, and citation building classes.
+```text
+prediction_node -> prediction_quality_gate -> planning_router
+rag_evidence_subagent -> evidence_quality_gate -> planning_router
+safety_contract_subagent -> safety_contract_gate -> planning_router
+fast_answer -> output_policy_gate -> response_packager
+```
 
-## Remaining Risks
+`answer_text_review` runs final public-text checks, then writes
+`ValidationReport.next_action`.
 
-- `DeterministicDiagnosticPolicy` is hidden behind `DiagnosticPlanner`, but the
-  next step is to make planning consume richer
-  `IntentResult` and `ContextPacks` signals.
-- RAG roles are split into classes, but they are not yet fully separate
-  LangGraph subgraph nodes with independent retry, latency, and quality metrics.
-- The legacy imperative graph module is removed. Root graph and the RAG
-  Evidence SubAgent call dedicated modules directly.
+```text
+pass
+  -> response_packager
+
+rewrite_only
+  -> invalidate_rewrite
+  -> answer_rewrite
+  -> answer_text_review
+
+rerun_rag
+  -> invalidate_rag_downstream
+  -> rag_evidence_subagent
+  -> planning_router
+
+rerun_safety
+  -> invalidate_safety_downstream
+  -> safety_contract_subagent
+  -> planning_router
+
+clarification_required
+  -> clarification_response
+  -> response_packager
+
+block
+  -> safe_block_response
+  -> response_packager
+
+max_retry_exceeded
+  -> safe_review_fallback
+  -> response_packager
+```
+
+Reexecution is visible in graph edges and is not handled by a root-internal
+upstream rerun helper.
+
+## Stale Artifact Invalidation
+
+Before retrying upstream work, stale downstream artifacts are tombstoned with
+`None`. This matters because compiled LangGraph channels do not treat an
+omitted key as deletion.
+
+`rerun_rag` clears:
+
+- `evidence`
+- `safety`
+- `draft`
+- `validation`
+- `response`
+
+`rerun_safety` clears:
+
+- `safety`
+- `draft`
+- `validation`
+- `response`
+
+`rewrite_only` clears:
+
+- `draft`
+- `validation`
+- `response`
+
+`request`, `context`, `planning`, `prediction`, and `runtime` are preserved.
+The planning artifact's `completed_nodes` set is updated so the router does not
+reuse stale RAG or safety completion.
+
+## AI4I And RAG Boundary
+
+AI4I CSV/process data is prediction input only. It is not a RAG corpus.
+
+```text
+AI4I process data
+  -> PredictionService
+```
+
+Document evidence comes from the manufacturing RAG corpus:
+
+```text
+OSHA / Haas / KOSHA documents
+  -> RAG Evidence SubAgent
+```
+
+RAG-only safety questions must not include AI4I probability language or failure
+mode probability language.
+
+## Public API Mapping
+
+The external `/agent/send` response model remains `AgentResponse`. The internal
+state is artifact-only, and `response_packager` plus the final response
+projection map artifacts to the public schema:
+
+- `ResponseArtifact.answer` -> `AgentResponse.answer`
+- `PredictionArtifact.result` -> `AgentResponse.prediction`
+- `EvidenceArtifact.documents` -> `AgentResponse.retrieved_documents`
+- `EvidenceArtifact.citations` -> `AgentResponse.citations`
+- `SafetyArtifact.public_guidance` -> `AgentResponse.safety_guidance`
+- `PlanningArtifact.agent_plan` -> `AgentResponse.plan`
+- `RuntimeArtifact.trace` -> `AgentResponse.trace`
+- `RuntimeArtifact.usage_records` -> `AgentResponse.llm_usage`
+
+Public answer text is sanitized before packaging. It must not contain:
+
+- `run_id`
+- `token`
+- `cost`
+- `model`
+- `raw_score`
+- `chunk_id`
+- `safety_gate_id`
+- `gate id`
+- `calls=`
+- `replans=`
+- `trace`
+- `internal_reason`
+- `forbidden_agent_actions`
+
+Internal trace, usage, citations, and context metadata can remain in structured
+debug fields of `AgentResponse`.
+
+## Checkpoint v3 Policy
+
+Checkpoint state is v3-only:
+
+- `state_schema_version = 3`
+- `thread_id = user_id:session_id`
+- v2 checkpoints are not migrated
+- non-v3 checkpoints are ignored by `_checkpoint_values`
+- default SQLite file uses `langgraph_checkpoints_v3.sqlite3`
+
+Checkpointed values are sanitized to JSON-like primitives only.

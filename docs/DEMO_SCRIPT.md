@@ -110,14 +110,17 @@ Streamlit 진행 trace에서는 현재 구조를 아래처럼 설명합니다.
 
 ```text
 ContextSubAgent
-IntentGateway
-PlanningSubAgent
-manufacturing_analysis
-RagEvidenceSubAgent
-SafetySubAgent
-response_synthesis
+planning_router
+prediction_node
+prediction_quality_gate
+rag_evidence_subagent
+evidence_quality_gate
+safety_contract_subagent
+safety_contract_gate
+answer_compose
+answer_text_review
 response_packager
-MemorySubAgent
+memory_writer
 audit_persistence
 ```
 
