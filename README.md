@@ -304,7 +304,10 @@ Current verification snapshot:
 
 ```text
 93 passed
+RAG eval notebook executes end-to-end without cell errors
 ```
+
+Portfolio-level RAG evaluation details are summarized in `docs/PORTFOLIO_ROADMAP.md`.
 
 ---
 

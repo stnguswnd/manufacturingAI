@@ -1,6 +1,6 @@
-id,retrieved_contexts_not_empty,retriever_recall_pass,citation_integrity_pass,no_error,response_not_empty,deterministic_pass_count
-rag-001,False,not_applicable,not_applicable,True,True,2
-rag-002,True,True,True,True,True,5
-rag-003,False,not_applicable,not_applicable,True,True,2
-rag-004,False,not_applicable,not_applicable,True,True,2
-rag-005,True,not_applicable,True,True,True,4
+id,retrieval_policy,citation_policy,retrieved_contexts_not_empty,retrieved_count,citation_count,expected_keyword_coverage,retrieval_policy_pass,citation_policy_pass,retriever_recall_pass,citation_integrity_pass,citation_doc_integrity_pass,answer_citation_labels_valid,selected_path_pass,intent_pass,expected_keywords_pass,forbidden_keywords_pass,no_error,response_not_empty,deterministic_pass_count,deterministic_fail_count,deterministic_pass_rate,deterministic_failure_reasons
+rag-001,optional,optional,False,0,0,0.333,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,False,False,False,True,True,True,3,3,0.5,selected_path_pass; intent_pass; expected_keywords_pass
+rag-002,required,required,True,3,3,1.0,True,True,True,True,True,True,True,True,True,True,True,True,12,0,1.0,
+rag-003,optional,optional,False,0,0,0.0,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,not_applicable,True,True,False,False,True,True,4,2,0.667,expected_keywords_pass; forbidden_keywords_pass
+rag-004,forbidden,forbidden,False,0,0,0.6,True,True,not_applicable,not_applicable,not_applicable,not_applicable,True,True,False,True,True,True,7,1,0.875,expected_keywords_pass
+rag-005,optional,optional,True,3,3,0.6,not_applicable,not_applicable,not_applicable,True,True,True,True,True,False,True,True,True,8,1,0.889,expected_keywords_pass
