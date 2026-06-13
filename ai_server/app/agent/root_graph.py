@@ -30,6 +30,7 @@ from app.agent.memory_subagent import MemoryInput
 from app.agent.planning_subagent import PlanningInput
 from app.agent.rag_evidence import RagEvidenceInput
 from app.agent.runtime_deps import AgentRuntimeDeps
+from app.agent.safety import ManufacturingIntentType
 from app.agent.safety_subagent import SafetyInput
 from app.agent.state import ManufacturingAgentState
 from app.agent.trace import to_agent_trace_steps, trace_step
@@ -245,6 +246,7 @@ class RootManufacturingGraph:
                 'answer_compose': 'answer_compose',
                 'clarification_response': 'clarification_response',
                 'fast_answer': 'fast_answer',
+                'safe_block_response': 'safe_block_response',
             },
         )
         graph.add_edge('prediction_node', 'prediction_quality_gate')
@@ -375,6 +377,7 @@ class RootManufacturingGraph:
             planning = previous
         else:
             planning = self._initial_planning(request, context, state)
+        planning = self._apply_intent_policy(planning, request)
 
         if planning.needs_prediction and not self._agent_request(state).process_data:
             planning = planning.model_copy(update={
@@ -393,6 +396,20 @@ class RootManufacturingGraph:
             'draft_ready': next_node == 'answer_compose',
         })
         state['planning'] = planning.model_dump(mode='json')
+        if next_node == 'safe_block_response':
+            state['validation'] = ValidationReport(
+                passed=False,
+                failures=[
+                    ValidationFailure(
+                        code='unsafe_operation_request',
+                        message='요청이 안전장치 우회, 운전 중 방호장치 개방, 경보 무시 운전 같은 위험 실행 지시를 요구합니다.',
+                        severity='critical',
+                        source='safety',
+                    )
+                ],
+                retryable=False,
+                next_action='block',
+            ).model_dump(mode='json')
         self._emit_trace(state, trace_step(
             node_id='planning.router',
             node_name='Planning Router',
@@ -863,6 +880,7 @@ class RootManufacturingGraph:
             evidence_artifact=self._evidence_artifact_or_none(state),
             safety_artifact=self._safety_artifact_or_none(state),
             needs_rag=planning.needs_rag,
+            intent_type=planning.intent_type,
         )
         report = self._finalize_quality_gate_report(state, gate='answer_text_review', report=report)
         state['validation'] = report.model_dump(mode='json')
@@ -878,6 +896,7 @@ class RootManufacturingGraph:
 
     def _output_policy_gate_node(self, state: ManufacturingAgentState) -> ManufacturingAgentState:
         response = self._response_artifact_or_none(state) or ResponseArtifact(answer='')
+        planning = self._planning_artifact_or_none(state)
         original = response.answer or ''
         sanitized = self._sanitize_public_answer(original)
         failures: list[ValidationFailure] = []
@@ -895,6 +914,28 @@ class RootManufacturingGraph:
                 severity='warning',
                 source='debug_leak',
             ))
+        dangerous_matches = self.deps.dangerous_output_detector.detect(
+            sanitized,
+            intent_type=planning.intent_type if planning else None,
+        )
+        if dangerous_matches:
+            failures.extend([
+                ValidationFailure(
+                    code='dangerous_output_instruction',
+                    message=f'Public answer contains dangerous executable instruction: {match}',
+                    severity='critical',
+                    source='safety',
+                )
+                for match in dangerous_matches[:3]
+            ])
+            block_report = ValidationReport(
+                passed=False,
+                failures=[failure for failure in failures if failure.code == 'dangerous_output_instruction'],
+                retryable=False,
+                next_action='block',
+            )
+            sanitized = self._sanitize_public_answer(self._safe_block_answer(block_report))
+            response = response.model_copy(update={'response_type': 'output_policy_block', 'safe_fallback_used': True})
         if not sanitized.strip():
             sanitized = '응답을 안정적으로 생성하지 못했습니다. 요청을 조금 더 구체화해 다시 보내 주세요.'
             response = response.model_copy(update={'response_type': 'output_policy_fallback', 'safe_fallback_used': True})
@@ -902,11 +943,12 @@ class RootManufacturingGraph:
             'answer': sanitized,
             'warnings': self._public_warning_lines(response.warnings),
         }).model_dump(mode='json')
+        has_block = any(failure.code == 'dangerous_output_instruction' for failure in failures)
         report = ValidationReport.pass_report() if not failures else ValidationReport(
-            passed=True,
+            passed=not has_block,
             failures=failures,
             retryable=False,
-            next_action='pass',
+            next_action='block' if has_block else 'pass',
         )
         self._finalize_quality_gate_report(state, gate='output_policy_gate', report=report)
         self._emit_trace(state, trace_step(
@@ -966,9 +1008,11 @@ class RootManufacturingGraph:
     def _safe_block_response_node(self, state: ManufacturingAgentState) -> ManufacturingAgentState:
         report = self._validation_report(state)
         answer = self._safe_block_answer(report)
+        planning = self._planning_artifact_or_none(state)
+        route = ['planning.router', 'response.safe_block'] if planning and planning.next_node == 'safe_block_response' else ['answer.text_review', 'response.safe_block']
         state['response'] = ResponseArtifact(
             answer=self._sanitize_public_answer(answer),
-            route=['answer.text_review', 'response.safe_block'],
+            route=route,
             warnings=self._public_warning_lines([failure.message for failure in report.failures]),
             response_type='safe_block',
         ).model_dump(mode='json')
@@ -1151,8 +1195,43 @@ class RootManufacturingGraph:
             warnings=list(output.trace.get('warnings') or []),
         )
 
+    def _apply_intent_policy(self, planning: PlanningArtifact, request: RequestArtifact) -> PlanningArtifact:
+        classification = self.deps.intent_risk_classifier.classify(
+            request.normalized_message or request.question,
+            selected_path=planning.selected_path,
+            answer_type=planning.answer_type,
+        )
+        answer_policy = self.deps.answer_policy_builder.build(
+            classification.intent_type,
+            classification.risk_level,
+            request.normalized_message or request.question,
+        )
+        updates: dict[str, Any] = {
+            'intent_type': classification.intent_type.value,
+            'risk_level': classification.risk_level,
+            'answer_policy': answer_policy,
+        }
+        if classification.intent_type == ManufacturingIntentType.UNSAFE_OPERATION_REQUEST:
+            updates.update({
+                'selected_path': 'unsafe_operation_request',
+                'answer_type': 'safe_block',
+                'needs_prediction': False,
+                'needs_rag': False,
+                'needs_safety': False,
+                'fast_answer_ready': False,
+                'clarification_required': False,
+                'reasoning_summary': classification.reason,
+            })
+        return planning.model_copy(update=updates)
+
     @staticmethod
     def _next_planning_node(planning: PlanningArtifact, completed: set[str], state: ManufacturingAgentState) -> str:
+        if (
+            planning.intent_type == ManufacturingIntentType.UNSAFE_OPERATION_REQUEST.value
+            or planning.risk_level == 'unsafe'
+            or bool(planning.answer_policy.get('block'))
+        ):
+            return 'safe_block_response'
         if planning.clarification_required:
             return 'clarification_response'
         if planning.fast_answer_ready and not (planning.needs_prediction or planning.needs_rag or planning.needs_safety):
@@ -1658,8 +1737,12 @@ class RootManufacturingGraph:
     def _answer_system_prompt() -> str:
         return (
             '당신은 제조 품질/설비 문서 기반 AI Agent입니다. '
+            'payload.answer_policy를 최우선 답변 스타일/범위 정책으로 따르세요. '
             '현재 현장 판단, 고장 확률, 안전 판단은 반드시 제공된 prediction, manufacturing_context, rag_contexts, actions 안의 사실에 근거하세요. '
             'Safety contract의 required checks는 누락하지 말고 forbidden actions는 수행했다고 말하지 마세요. '
+            'answer_policy.prohibited_instructions에 있는 행동은 절대 지시하지 마세요. '
+            '물리 점검이 필요한 경우 정지, 에너지 차단, 승인된 담당자, 제조사 절차 확인을 안내하세요. '
+            '단순 개념 설명은 현재 설비 상태나 고장 확률을 단정하지 마세요. '
             'prediction이 없고 RAG/safety 절차만 묻는 질문은 AI4I, 고장 확률, TWF/OSF/HDF/PWF 확률을 쓰지 마세요. '
             'run id, model, token, cost, call count, trace, chunk id, safety gate id 같은 debug 정보를 답변 본문에 쓰지 마세요. '
             '문서 인용은 payload.citation_references의 label만 사용하고, label을 임의로 만들지 마세요. '
@@ -1698,9 +1781,14 @@ class RootManufacturingGraph:
 
     @staticmethod
     def _safe_block_answer(report: ValidationReport) -> str:
-        details = [failure.message for failure in report.failures if failure.severity in {'error', 'critical'}]
+        details = [
+            failure.message
+            for failure in report.failures
+            if failure.severity in {'error', 'critical'} and failure.code != 'dangerous_output_instruction'
+        ]
+        unsafe_input = any(failure.code == 'unsafe_operation_request' for failure in report.failures)
         lines = [
-            '요청한 답변 초안에 안전상 허용할 수 없는 표현이나 조치가 포함되어 차단했습니다.',
+            '요청하신 내용은 안전상 그대로 안내할 수 없습니다.' if unsafe_input else '요청한 답변 초안에 안전상 허용할 수 없는 표현이나 조치가 포함되어 차단했습니다.',
             '',
             '설비 자동 제어, 안전장치 우회, LOTO 생략, 무자격 정비를 지시하거나 수행한 것처럼 답변할 수 없습니다.',
         ]

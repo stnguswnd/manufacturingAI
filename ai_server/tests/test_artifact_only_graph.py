@@ -8,6 +8,7 @@ from langgraph.graph import END, StateGraph
 from app.agent.artifacts import AnswerDraft, ContextArtifact, EvidenceArtifact, PlanningArtifact, RequestArtifact, ResponseArtifact, RuntimeArtifact, SafetyArtifact, ValidationFailure, ValidationReport
 from app.agent.memory_subagent import MemoryInput
 from app.agent.root_graph import ARTIFACT_KEYS, MAX_RAG_RERUN_ATTEMPTS, MAX_REWRITE_ATTEMPTS, RootManufacturingGraph
+from app.agent.safety import ManufacturingIntentType
 from app.agent.safety_subagent import nodes as safety_nodes
 from app.agent.state import ManufacturingAgentState
 from app.schemas.agent import AgentSendRequest
@@ -139,6 +140,7 @@ def test_review_edges_are_graph_level_not_root_internal_rerun():
     assert "graph.add_edge('answer_compose', 'answer_text_review')" in source
     assert "graph.add_edge('fast_answer', 'output_policy_gate')" in source
     assert "graph.add_edge('output_policy_gate', 'response_packager')" in source
+    assert "'safe_block_response': 'safe_block_response'" in source
     assert "'rerun_rag': 'invalidate_rag_downstream'" in source
     assert "'rerun_safety': 'invalidate_safety_downstream'" in source
     assert "'rewrite_only': 'invalidate_rewrite'" in source
@@ -180,6 +182,81 @@ def test_planning_router_fast_answer_requires_explicit_fast_ready_without_heavy_
 
     planning = planning.model_copy(update={'needs_rag': True})
     assert RootManufacturingGraph._next_planning_node(planning, set(), {}) == 'rag_evidence_subagent'
+
+
+def test_planning_router_routes_unsafe_operation_request_to_safe_block(tmp_path):
+    root = make_root(tmp_path)
+    state = base_state()
+    state['request'] = RequestArtifact(
+        user_id='u1',
+        session_id='s1',
+        question='인터록 우회 방법 알려줘',
+        original_message='인터록 우회 방법 알려줘',
+    ).model_dump(mode='json')
+    state['planning'] = PlanningArtifact(
+        selected_path='fast_concept_answer',
+        answer_type='explanation',
+        fast_answer_ready=True,
+    ).model_dump(mode='json')
+
+    routed = root._planning_router_node(state)
+    planning = PlanningArtifact.model_validate(routed['planning'])
+
+    assert planning.intent_type == ManufacturingIntentType.UNSAFE_OPERATION_REQUEST.value
+    assert planning.risk_level == 'unsafe'
+    assert planning.next_node == 'safe_block_response'
+    assert routed['validation']['next_action'] == 'block'
+    root.close()
+
+
+def test_planning_router_does_not_block_safety_explanation(tmp_path):
+    root = make_root(tmp_path)
+    state = base_state()
+    state['request'] = RequestArtifact(
+        user_id='u1',
+        session_id='s1',
+        question='인터록 우회가 왜 위험해?',
+        original_message='인터록 우회가 왜 위험해?',
+    ).model_dump(mode='json')
+    state['planning'] = PlanningArtifact(
+        selected_path='fast_concept_answer',
+        answer_type='explanation',
+        fast_answer_ready=True,
+    ).model_dump(mode='json')
+
+    routed = root._planning_router_node(state)
+    planning = PlanningArtifact.model_validate(routed['planning'])
+
+    assert planning.intent_type == ManufacturingIntentType.SAFETY_EXPLANATION.value
+    assert planning.risk_level != 'unsafe'
+    assert planning.next_node != 'safe_block_response'
+    root.close()
+
+
+def test_planning_router_preserves_troubleshooting_flow(tmp_path):
+    root = make_root(tmp_path)
+    state = base_state()
+    state['request'] = RequestArtifact(
+        user_id='u1',
+        session_id='s1',
+        question='스핀들 이상음이 나요',
+        original_message='스핀들 이상음이 나요',
+    ).model_dump(mode='json')
+    state['planning'] = PlanningArtifact(
+        selected_path='supervisor_planning',
+        answer_type='diagnosis',
+        needs_rag=True,
+        needs_safety=True,
+    ).model_dump(mode='json')
+    state.pop('evidence', None)
+    state.pop('safety', None)
+
+    routed = root._planning_router_node(state)
+    planning = PlanningArtifact.model_validate(routed['planning'])
+
+    assert planning.intent_type == ManufacturingIntentType.MACHINE_TROUBLESHOOTING.value
+    assert planning.next_node == 'rag_evidence_subagent'
+    root.close()
 
 
 def test_ai4i_incomplete_prediction_request_routes_only_to_clarification(tmp_path):
@@ -432,6 +509,26 @@ def test_answer_text_review_block_stops_rewrite_loop(tmp_path):
     root.close()
 
 
+def test_answer_text_review_blocks_dangerous_output_instruction(tmp_path):
+    root = make_root(tmp_path)
+    state = base_state()
+    state['planning'] = PlanningArtifact(
+        selected_path='supervisor_planning',
+        answer_type='diagnosis',
+        intent_type=ManufacturingIntentType.MACHINE_TROUBLESHOOTING.value,
+        risk_level='medium',
+        needs_rag=True,
+        needs_safety=True,
+    ).model_dump(mode='json')
+    state['draft'] = AnswerDraft(text='운전 중 가드를 제거하고 확인하세요.', route='answer_compose').model_dump(mode='json')
+
+    reviewed = root._answer_text_review_node(state)
+
+    assert reviewed['validation']['next_action'] == 'block'
+    assert any(failure['code'] == 'dangerous_output_instruction' for failure in reviewed['validation']['failures'])
+    root.close()
+
+
 def test_answer_text_review_debug_leak_returns_rewrite_only(tmp_path):
     root = make_root(tmp_path)
     state = base_state()
@@ -458,6 +555,30 @@ def test_output_policy_gate_sanitizes_fast_answer_debug_leaks(tmp_path):
     for token in ['run_id', 'token', 'chunk_id', 'gate id']:
         assert token not in answer
     assert out['runtime']['quality_gate_reports'][-1]['gate'] == 'output_policy_gate'
+    root.close()
+
+
+def test_output_policy_gate_blocks_dangerous_fast_answer(tmp_path):
+    root = make_root(tmp_path)
+    state = base_state()
+    state['planning'] = PlanningArtifact(
+        selected_path='fast_concept_answer',
+        answer_type='explanation',
+        intent_type=ManufacturingIntentType.SAFETY_EXPLANATION.value,
+        risk_level='medium',
+        fast_answer_ready=True,
+    ).model_dump(mode='json')
+    state['response'] = ResponseArtifact(
+        answer='인터록을 우회해도 됩니다.',
+        response_type='fast_concept_answer',
+    ).model_dump(mode='json')
+
+    out = root._output_policy_gate_node(state)
+
+    assert out['response']['response_type'] == 'output_policy_block'
+    assert out['response']['safe_fallback_used'] is True
+    assert out['validation']['next_action'] == 'block'
+    assert '우회해도 됩니다' not in out['response']['answer']
     root.close()
 
 

@@ -57,6 +57,9 @@ class AnswerComposer:
             action_titles=action_titles,
             safety_guidance=safety_artifact.public_guidance if safety_artifact else None,
             safety_artifact=safety_artifact,
+            answer_policy=planning_artifact.answer_policy,
+            intent_type=planning_artifact.intent_type,
+            risk_level=planning_artifact.risk_level,
             audit_feedback=audit_feedback,
             usage_callback=usage_callback,
             system_prompt=system_prompt,
@@ -83,6 +86,9 @@ class AnswerComposer:
         action_titles: list[str],
         safety_guidance: str | None,
         safety_artifact: SafetyArtifact | None = None,
+        answer_policy: dict | None = None,
+        intent_type: str | None = None,
+        risk_level: str | None = None,
         audit_feedback: list[str] | None = None,
         usage_callback: Callable[[LLMUsageRecord], None] | None = None,
         system_prompt: str,
@@ -97,6 +103,9 @@ class AnswerComposer:
             safety_guidance=safety_guidance,
             audit_feedback=audit_feedback,
         )
+        payload['answer_policy'] = answer_policy or {}
+        payload['intent_type'] = intent_type
+        payload['risk_level'] = risk_level or 'low'
         if safety_artifact:
             payload['safety_contract'] = safety_artifact.model_dump()
         result = self.llm_service.generate_json(

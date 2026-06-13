@@ -94,6 +94,10 @@ class SafetyValidationService:
             '보장하지',
             '수행하지',
             '제어하지',
+            '제거 없이',
+            '우회 없이',
+            '개방 없이',
+            '하지 않고',
         ]
         return any(term in line for term in policy_terms)
 

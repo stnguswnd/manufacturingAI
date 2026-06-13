@@ -52,6 +52,9 @@ class PlanningArtifact(BaseModel):
     selected_path: str
     answer_type: str
     intent: str | None = None
+    intent_type: str | None = None
+    risk_level: str = 'low'
+    answer_policy: dict[str, Any] = Field(default_factory=dict)
     needs_prediction: bool = False
     needs_rag: bool = False
     needs_safety: bool = False

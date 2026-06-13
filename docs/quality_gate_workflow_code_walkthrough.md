@@ -678,7 +678,7 @@ public answer에는 debug/internal metadata가 없어야 한다.
 최근 전체 테스트 결과:
 
 ```text
-124 passed
+136 passed
 ```
 
 ## 15. 구조상 남은 판단 기준
@@ -693,3 +693,385 @@ public answer에는 debug/internal metadata가 없어야 한다.
 6. public API schema는 `response_packager`에서만 projection한다.
 7. retry budget 없이 재실행 edge를 추가하지 않는다.
 
+## 16. Intent / Risk Policy Layer
+
+v3 runtime은 현업 LLM 애플리케이션처럼 모든 위험 판단을 프롬프트 하나에 맡기지 않는다.
+
+```text
+입력 intent/risk classification
+ -> intent별 answer policy 생성
+ -> AnswerComposer payload 주입
+ -> 최종 출력 dangerous instruction thin check
+```
+
+이 계층은 새 SubAgent가 아니다. `PlanningArtifact`와 기존 Quality Gate workflow에 얇게 연결되는 deterministic policy layer다.
+
+핵심 원칙:
+
+```text
+단순 금지어 필터를 사용하지 않는다.
+"인터록", "가드 제거", "LOTO" 같은 단어 하나만으로 차단하지 않는다.
+위험 실행 맥락과 지시 의도가 함께 있을 때만 차단한다.
+```
+
+차단:
+
+```text
+- 인터록 우회 방법 알려줘
+- 운전 중 가드 제거하고 확인하는 법 알려줘
+```
+
+차단하지 않음:
+
+```text
+- 인터록 우회가 왜 위험해?
+- 가드 제거 없이 확인할 방법이 있어?
+- LOTO가 뭐야?
+```
+
+구현 위치:
+
+```text
+ai_server/app/agent/safety/policy_layer.py
+```
+
+Intent enum:
+
+```python
+class ManufacturingIntentType(str, Enum):
+    CONCEPT_EXPLANATION = 'concept_explanation'
+    MACHINE_TROUBLESHOOTING = 'machine_troubleshooting'
+    SAFETY_EXPLANATION = 'safety_explanation'
+    MAINTENANCE_PROCEDURE = 'maintenance_procedure'
+    UNSAFE_OPERATION_REQUEST = 'unsafe_operation_request'
+    FIELD_LOG_INSUFFICIENT = 'field_log_insufficient'
+    GENERAL_CHAT = 'general_chat'
+```
+
+`PlanningArtifact`에는 policy layer 결과가 저장된다.
+
+```python
+class PlanningArtifact(BaseModel):
+    selected_path: str
+    answer_type: str
+    intent: str | None = None
+    intent_type: str | None = None
+    risk_level: str = 'low'
+    answer_policy: dict[str, Any] = Field(default_factory=dict)
+```
+
+Classifier는 deterministic rule 기반이다.
+
+```python
+classification = self.deps.intent_risk_classifier.classify(
+    request.normalized_message or request.question,
+    selected_path=planning.selected_path,
+    answer_type=planning.answer_type,
+)
+answer_policy = self.deps.answer_policy_builder.build(
+    classification.intent_type,
+    classification.risk_level,
+    request.normalized_message or request.question,
+)
+```
+
+Unsafe operation request는 `planning_router`에서 바로 safe block으로 간다.
+
+```python
+if classification.intent_type == ManufacturingIntentType.UNSAFE_OPERATION_REQUEST:
+    updates.update({
+        'selected_path': 'unsafe_operation_request',
+        'answer_type': 'safe_block',
+        'needs_prediction': False,
+        'needs_rag': False,
+        'needs_safety': False,
+        'fast_answer_ready': False,
+        'clarification_required': False,
+    })
+```
+
+라우터 정책:
+
+```python
+if (
+    planning.intent_type == ManufacturingIntentType.UNSAFE_OPERATION_REQUEST.value
+    or planning.risk_level == 'unsafe'
+    or bool(planning.answer_policy.get('block'))
+):
+    return 'safe_block_response'
+```
+
+중요한 차이는 다음이다.
+
+```text
+UNSAFE_OPERATION_REQUEST
+  -> safe_block_response
+
+SAFETY_EXPLANATION
+  -> block하지 않음
+  -> 기존 fast/heavy flow 유지
+```
+
+## 17. Answer Policy Builder
+
+`AnswerPolicy`는 "어떻게 말할지"에 대한 정책이다.
+
+`SafetyArtifact`는 "무엇을 반드시 포함해야 하는지"에 대한 안전 계약이다.
+
+둘을 섞지 않는다.
+
+구현 위치:
+
+```text
+ai_server/app/agent/safety/policy_layer.py
+```
+
+예: `MACHINE_TROUBLESHOOTING`
+
+```python
+{
+    'answer_scope': 'troubleshooting_support',
+    'risk_level': risk_level,
+    'start_with_non_invasive_checks': True,
+    'required_diagnostics': [
+        '알람 코드',
+        '발생 시점',
+        'RPM',
+        '부하',
+        '온도',
+        '진동 조건',
+        '공구 상태',
+        '윤활/냉각 상태',
+    ],
+    'prohibited_instructions': [
+        '운전 중 회전부 접근',
+        '운전 중 커버 개방',
+        '가드 제거 후 운전',
+        '인터록 우회',
+        '경보 무시 운전',
+    ],
+    'required_safety_guidance': [
+        '물리 점검 필요 시 장비 정지',
+        '전원 차단',
+        'LOTO 또는 현장 에너지 차단 절차',
+        '승인된 담당자',
+        '제조사 절차 확인',
+    ],
+}
+```
+
+예: `SAFETY_EXPLANATION`
+
+```python
+{
+    'answer_scope': 'safety_explanation',
+    'allow_explanation_of_hazard': True,
+    'do_not_provide_bypass_steps': True,
+    'explain_why_unsafe': True,
+    'required_safety_guidance': [
+        '우회/해제 절차가 아니라 위험성과 안전한 대안 중심으로 설명',
+    ],
+}
+```
+
+예: `CONCEPT_EXPLANATION`
+
+```python
+{
+    'answer_scope': 'concept_only',
+    'avoid_current_machine_state_claims': True,
+    'avoid_failure_probability_without_prediction': True,
+    'keep_answer_lightweight': True,
+}
+```
+
+`AnswerComposer`는 `PlanningArtifact.answer_policy`를 LLM payload에 주입한다.
+
+```python
+payload['answer_policy'] = answer_policy or {}
+payload['intent_type'] = intent_type
+payload['risk_level'] = risk_level or 'low'
+```
+
+system prompt에는 policy 우선순위만 짧게 넣는다.
+
+```text
+payload.answer_policy를 최우선 답변 스타일/범위 정책으로 따른다.
+SafetyArtifact.constraints와 EvidenceArtifact.citations를 근거로 답한다.
+answer_policy.prohibited_instructions는 절대 지시하지 않는다.
+물리 점검이 필요한 경우 정지/에너지 차단/승인된 담당자/제조사 절차를 안내한다.
+단순 개념 설명은 현재 설비 상태나 고장 확률을 단정하지 않는다.
+```
+
+Typed recommended action도 policy에 포함된다.
+
+```python
+class RecommendedAction(BaseModel):
+    title: str
+    action_type: Literal[
+        'observe',
+        'check_log',
+        'non_invasive_inspection',
+        'stop_machine',
+        'qualified_maintenance',
+        'contact_safety_manager',
+        'clarify_input',
+    ]
+    risk_level: Literal['low', 'medium', 'high'] = 'low'
+    requires_physical_access: bool = False
+    requires_qualified_person: bool = False
+    requires_energy_isolation: bool = False
+    forbidden_if_machine_running: bool = False
+```
+
+규칙:
+
+```text
+AI가 설비를 직접 정지/제어했다고 표현하지 않는다.
+stop_machine은 사용자가 현장 절차에 따라 정지 확인하거나 담당자에게 요청하는 표현으로만 쓴다.
+physical access가 필요한 action은 qualified person 또는 energy isolation flag를 갖는다.
+forbidden_if_machine_running=True인 action은 운전 중 수행하라고 말하지 않는다.
+```
+
+## 18. Lightweight Dangerous Output Check
+
+최종 출력 단계에서는 명확한 위험 실행 지시만 얇게 검수한다. 이 검사는 모든 safety 판단을 대신하지 않는다. 입력 intent/risk classification과 SafetyArtifact contract가 먼저 적용되고, output detector는 마지막 방어선이다.
+
+구현 위치:
+
+```text
+ai_server/app/agent/safety/policy_layer.py
+```
+
+대표 패턴:
+
+```python
+DANGEROUS_OUTPUT_PATTERNS = [
+    r'운전\s*중.*(가드|커버).*(제거|개방|탈거|해제).*(하세요|확인하세요|가능합니다|해도\s*됩니다)',
+    r'(회전\s*중|가동\s*중).*(커버|가드).*(열고|개방|제거).*(확인|점검)',
+    r'(인터록|방호장치).*(우회|무력화|해제).*(하세요|가능합니다|해도\s*됩니다)',
+    r'(경보|알람|진동|이상음|과열).*(무시하고|계속\s*가동|계속\s*운전)',
+]
+```
+
+출력 차단:
+
+```text
+- 운전 중 가드를 제거하고 확인하세요.
+- 가동 중 커버를 열고 점검하세요.
+- 인터록을 우회해도 됩니다.
+- 알람은 무시하고 계속 운전하세요.
+```
+
+출력 허용:
+
+```text
+- 운전 중 가드를 제거하면 위험하므로 금지해야 합니다.
+- 인터록 우회가 왜 위험한지 설명하면...
+- LOTO는 에너지 차단과 잠금/표지 절차입니다.
+- 가드 제거 없이 확인할 수 있는 비침습 점검부터 하세요.
+```
+
+`answer_text_review`에서는 detector 결과가 `block`으로 병합된다.
+
+```python
+dangerous_output_report = self.dangerous_output_detector.review(
+    draft,
+    intent_type=intent_type,
+)
+return self._merge([citation_report, safety_report, dangerous_output_report])
+```
+
+`output_policy_gate`에서는 fast path 답변에 위험 실행 지시가 있으면 public answer를 safe block response로 치환한다.
+
+```python
+dangerous_matches = self.deps.dangerous_output_detector.detect(
+    sanitized,
+    intent_type=planning.intent_type if planning else None,
+)
+if dangerous_matches:
+    sanitized = self._sanitize_public_answer(self._safe_block_answer(block_report))
+    response = response.model_copy(update={
+        'response_type': 'output_policy_block',
+        'safe_fallback_used': True,
+    })
+```
+
+주의:
+
+```text
+차단 응답에서도 원래 위험 실행 문장을 차단 사유로 다시 노출하지 않는다.
+```
+
+## 19. Policy Layer Test Cases
+
+추가 테스트 위치:
+
+```text
+ai_server/tests/test_safety_policy_layer.py
+ai_server/tests/test_artifact_only_graph.py
+```
+
+Intent / Risk Classifier:
+
+```text
+"인터록 우회 방법 알려줘"
+  -> UNSAFE_OPERATION_REQUEST
+  -> risk_level="unsafe"
+
+"운전 중 가드 제거하고 확인하는 법 알려줘"
+  -> UNSAFE_OPERATION_REQUEST
+  -> risk_level="unsafe"
+
+"인터록 우회가 왜 위험해?"
+  -> SAFETY_EXPLANATION
+  -> block 아님
+
+"가드 제거 없이 확인할 방법이 있어?"
+  -> MACHINE_TROUBLESHOOTING 또는 SAFETY_EXPLANATION
+  -> block 아님
+
+"스핀들 이상음이 나요"
+  -> MACHINE_TROUBLESHOOTING
+
+"토크란?"
+  -> CONCEPT_EXPLANATION
+```
+
+Answer Policy Builder:
+
+```text
+MACHINE_TROUBLESHOOTING policy에 비침습 점검과 알람/RPM/부하/진동/공구/윤활/냉각 확인이 포함된다.
+MACHINE_TROUBLESHOOTING policy에 운전 중 회전부 접근, 가드 제거, 인터록 우회 금지가 포함된다.
+SAFETY_EXPLANATION은 위험성 설명을 허용하되 우회 절차 제공을 금지한다.
+CONCEPT_EXPLANATION은 현재 설비 상태/고장 확률 단정을 금지한다.
+```
+
+Dangerous Output Detector:
+
+```text
+운전 중 가드를 제거하고 확인하세요.
+  -> block
+
+운전 중 가드를 제거하면 위험하므로 금지해야 합니다.
+  -> allow
+```
+
+Graph / Routing:
+
+```text
+UNSAFE_OPERATION_REQUEST는 planning_router에서 safe_block_response로 간다.
+SAFETY_EXPLANATION은 safe_block_response로 가지 않는다.
+MACHINE_TROUBLESHOOTING은 기존 RAG/Safety flow를 유지한다.
+fast_answer는 output_policy_gate를 통과한다.
+answer_text_review는 dangerous output을 block으로 보낸다.
+```
+
+Regression:
+
+```text
+root runtime state에 legacy field가 없어야 한다.
+SafetySubAgent에 RagService/Chroma/CitationBuilder 의존이 없어야 한다.
+public answer에 run_id/token/cost/chunk_id/safety_gate_id/gate id가 없어야 한다.
+AI4I feature 부족 요청은 기존처럼 clarification_response로 끝나야 한다.
+```

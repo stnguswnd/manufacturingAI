@@ -12,6 +12,7 @@ from app.agent.heavy.rag_query_planner import RagFanoutPolicy
 from app.agent.memory_subagent import MemoryDeps, MemorySubAgent
 from app.agent.planning_subagent import PlanningDeps, PlanningSubAgent
 from app.agent.rag_evidence import RagEvidenceDeps, RagEvidenceSubAgent
+from app.agent.safety import AnswerPolicyBuilder, DangerousOutputDetector, ManufacturingIntentClassifier
 from app.agent.safety_subagent import SafetyDeps, SafetySubAgent
 from app.agent.validators import CitationVerifier, SafetyCritic
 from app.services.context_service import ContextService
@@ -52,6 +53,9 @@ class AgentRuntimeDeps:
     answer_composer: AnswerComposer
     answer_rewriter: AnswerRewriter
     answer_review_loop: AnswerReviewLoop
+    intent_risk_classifier: ManufacturingIntentClassifier
+    answer_policy_builder: AnswerPolicyBuilder
+    dangerous_output_detector: DangerousOutputDetector
 
     @classmethod
     def from_services(
@@ -104,6 +108,9 @@ class AgentRuntimeDeps:
         ))
         payload_builder = StructuredAnswerPayloadBuilder()
         answer_composer = AnswerComposer(llm_service, payload_builder)
+        intent_risk_classifier = ManufacturingIntentClassifier()
+        answer_policy_builder = AnswerPolicyBuilder()
+        dangerous_output_detector = DangerousOutputDetector()
         return cls(
             store=store,
             prediction_service=prediction_service,
@@ -128,5 +135,9 @@ class AgentRuntimeDeps:
             answer_review_loop=AnswerReviewLoop(
                 citation_verifier=CitationVerifier(),
                 safety_critic=SafetyCritic(safety_validator),
+                dangerous_output_detector=dangerous_output_detector,
             ),
+            intent_risk_classifier=intent_risk_classifier,
+            answer_policy_builder=answer_policy_builder,
+            dangerous_output_detector=dangerous_output_detector,
         )
